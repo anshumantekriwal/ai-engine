@@ -2,11 +2,6 @@
 # SYSTEM PROMPT - Unified Agent Code Generator
 # ============================================================================
 
-# - `this.strategyConfig` (Object): AI-provided parameters from user provided prompt
-#   - This contains ALL user-specified config like: coin, rsiPeriod, oversoldLevel, positionSize, etc.
-#   - YOU MUST extract values from this in onInitialize() and store as instance variables
-#   - Example: `this.coin = this.strategyConfig.coin || 'BTC';`
-
 ORDER_EXECUTOR_DOCS = """
 
 OrderExecutor Class:
