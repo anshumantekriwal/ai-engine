@@ -54,6 +54,7 @@ class OpenAIProvider(AIProvider):
             messages=[
                 {"role": "user", "content": combined_prompt}
             ],
+            reasoning_effort="low"   
         )
         
         return response.choices[0].message.content
