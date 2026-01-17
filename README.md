@@ -70,19 +70,21 @@ cp env.example .env
 
 Required environment variables:
 ```bash
-# At least one AI provider API key
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
+# AI Provider Configuration
+AI_PROVIDER=anthropic  # Options: "anthropic" or "openai"
+ANTHROPIC_API_KEY=sk-ant-...  # Required if using Anthropic
+OPENAI_API_KEY=sk-...  # Required if using OpenAI
 
 # Supabase credentials
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=your-service-key
 
-# Optional: Configuration
-DEFAULT_AI_PROVIDER=anthropic
-DEFAULT_MODEL=claude-sonnet-4
-TEMPERATURE=0.2
-MAX_TOKENS=4000
+# Optional: Model Configuration
+AI_MODEL=  # Leave blank for defaults (claude-sonnet-4-5 or gpt-5.2)
+
+# Optional: Generation Settings
+MAX_RETRIES=3
+VALIDATION_ENABLED=true
 ```
 
 ## Usage

@@ -17,6 +17,22 @@ from supabase import create_client, Client
 from ai_providers import get_provider
 from code_generator import CodeGenerator
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events"""
+    # Startup
+    print("=" * 60)
+    print("🚀 AI Agent Code Generator")
+    print("=" * 60)
+    print(f"Provider: {AI_PROVIDER.upper()}")
+    print(f"Model: {AI_MODEL}")
+    print(f"Validation: {'Enabled' if VALIDATION_ENABLED else 'Disabled'}")
+    print("=" * 60)
+    yield
+    # Shutdown (if needed)
+
 # Load environment variables
 load_dotenv()
 
@@ -24,7 +40,8 @@ load_dotenv()
 app = FastAPI(
     title="AI Agent Code Generator",
     description="Generate trading agent code using AI",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS middleware
@@ -43,16 +60,34 @@ supabase: Client = create_client(
 )
 
 # AI Configuration
-AI_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.2")
+AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").lower()
+AI_MODEL = os.getenv("AI_MODEL", None)
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 VALIDATION_ENABLED = os.getenv("VALIDATION_ENABLED", "true").lower() == "true"
 
-AI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not AI_API_KEY:
-    raise ValueError("Missing OPENAI_API_KEY environment variable")
+# Get API key based on provider
+if AI_PROVIDER == "anthropic":
+    AI_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    if not AI_API_KEY:
+        raise ValueError("Missing ANTHROPIC_API_KEY environment variable")
+    DEFAULT_MODEL = "claude-sonnet-4-5"
+elif AI_PROVIDER == "openai":
+    AI_API_KEY = os.getenv("OPENAI_API_KEY")
+    if not AI_API_KEY:
+        raise ValueError("Missing OPENAI_API_KEY environment variable")
+    DEFAULT_MODEL = "gpt-5.2"
+else:
+    raise ValueError(f"Invalid AI_PROVIDER: {AI_PROVIDER}. Must be 'openai' or 'anthropic'")
+
+# Use model from env or default
+AI_MODEL = AI_MODEL or DEFAULT_MODEL
 
 # Initialize AI provider and code generator
-ai_provider = get_provider(AI_API_KEY, AI_MODEL)
+ai_provider = get_provider(
+    api_key=AI_API_KEY,
+    model=AI_MODEL,
+    provider=AI_PROVIDER
+)
 code_generator = CodeGenerator(
     ai_provider=ai_provider,
     max_retries=MAX_RETRIES,
@@ -114,6 +149,7 @@ class GenerateResponse(BaseModel):
 class StatusResponse(BaseModel):
     """Status check response"""
     status: str
+    provider: str
     model: str
     validation_enabled: bool
 
@@ -127,6 +163,7 @@ async def status():
     """Health check endpoint"""
     return StatusResponse(
         status="running",
+        provider=AI_PROVIDER,
         model=AI_MODEL,
         validation_enabled=VALIDATION_ENABLED
     )
@@ -219,17 +256,6 @@ async def generate_and_store(request: CodeRequest):
 # ============================================================================
 # STARTUP
 # ============================================================================
-
-@app.on_event("startup")
-async def startup():
-    """Run on server startup"""
-    print("=" * 60)
-    print("🚀 AI Agent Code Generator")
-    print("=" * 60)
-    print(f"Model: {AI_MODEL}")
-    print(f"Validation: {'Enabled' if VALIDATION_ENABLED else 'Disabled'}")
-    print("=" * 60)
-
 
 if __name__ == "__main__":
     import uvicorn
