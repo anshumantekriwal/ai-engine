@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 import os
 from openai import OpenAI
+from anthropic import Anthropic
 
 
 class AIProvider(ABC):
@@ -93,10 +94,83 @@ class OpenAIProvider(AIProvider):
         return json.loads(response_text)
 
 
-def get_provider(api_key: str, model: Optional[str] = None) -> AIProvider:
-    """Factory function to get AI provider"""
+class AnthropicProvider(AIProvider):
+    """Anthropic Claude AI provider"""
     
-    return OpenAIProvider(
-        api_key=api_key,
-        model=model or "o1"
-    )
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5"):
+        self.client = Anthropic(api_key=api_key)
+        self.model = model
+    
+    async def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str
+    ) -> str:
+        """Generate text completion using Claude"""
+        
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8192,
+            system=system_prompt,
+            temperature=0.7,
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        return response.content[0].text
+    
+    async def generate_with_json(
+        self,
+        system_prompt: str,
+        user_prompt: str
+    ) -> Dict[str, Any]:
+        """Generate JSON response using Claude"""
+        import json
+        
+        enhanced_system = f"{system_prompt}\n\nRespond with valid JSON only."
+        
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8192,
+            system=enhanced_system,
+            temperature=0.7,
+            messages=[
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        response_text = response.content[0].text
+        
+        # Extract JSON if wrapped in markdown
+        if "```json" in response_text:
+            start = response_text.find("```json") + 7
+            end = response_text.find("```", start)
+            response_text = response_text[start:end].strip()
+        elif "```" in response_text:
+            start = response_text.find("```") + 3
+            end = response_text.find("```", start)
+            response_text = response_text[start:end].strip()
+        
+        return json.loads(response_text)
+
+
+def get_provider(api_key: str, model: Optional[str] = None, provider: str = "anthropic") -> AIProvider:
+    """Factory function to get AI provider
+    
+    Args:
+        api_key: API key for the provider
+        model: Model name (optional, uses default for provider)
+        provider: Provider name ('openai' or 'anthropic')
+    """
+    
+    if provider.lower() == "anthropic":
+        return AnthropicProvider(
+            api_key=api_key,
+            model=model or "claude-sonnet-4-5"
+        )
+    else:
+        return OpenAIProvider(
+            api_key=api_key,
+            model=model or "o1"
+        )
