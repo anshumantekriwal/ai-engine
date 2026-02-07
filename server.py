@@ -127,6 +127,42 @@ class GenerateRequest(BaseModel):
         }
 
 
+class CreateAgentRequest(BaseModel):
+    """Request to create agent in Supabase from generated code"""
+    user_id: str = Field(..., description="User ID")
+    agent_name: str = Field(..., description="Agent name")
+    strategy_description: str = Field(..., description="Trading strategy description")
+    initialization_code: str = Field(..., description="Initialization code")
+    trigger_code: str = Field(..., description="Trigger code")
+    execution_code: str = Field(..., description="Execution code")
+    hyperliquid_address: str = Field(..., description="Hyperliquid wallet address")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": "user_123",
+                "agent_name": "RSI Scalper",
+                "strategy_description": "Buy BTC when RSI drops below 30",
+                "initialization_code": "console.log('init')",
+                "trigger_code": "this.registerScheduledTrigger(60000, async (data) => {})",
+                "execution_code": "console.log('execute')",
+                "hyperliquid_address": "0x..."
+            }
+        }
+
+
+class RunAgentRequest(BaseModel):
+    """Request to run an agent"""
+    agent_id: str = Field(..., description="Agent UUID from Supabase")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "agent_id": "123e4567-e89b-12d3-a456-426614174000"
+            }
+        }
+
+
 class CodeResponse(BaseModel):
     """Response from code generation"""
     success: bool
@@ -143,6 +179,23 @@ class GenerateResponse(BaseModel):
     initialization_code: Optional[str] = None
     trigger_code: Optional[str] = None
     execution_code: Optional[str] = None
+    error: Optional[str] = None
+
+
+class CreateAgentResponse(BaseModel):
+    """Response from agent creation"""
+    success: bool
+    agent_id: Optional[str] = None
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+class RunAgentResponse(BaseModel):
+    """Response from running agent"""
+    success: bool
+    agent_id: Optional[str] = None
+    message: Optional[str] = None
+    pid: Optional[int] = None
     error: Optional[str] = None
 
 
@@ -248,6 +301,115 @@ async def generate_and_store(request: CodeRequest):
         print(f"❌ Failed: {str(e)}")
         print(f"{'='*60}\n")
         return CodeResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+@app.post("/create-agent", response_model=CreateAgentResponse)
+async def create_agent(request: CreateAgentRequest):
+    """
+    Create agent in Supabase from already generated code
+    """
+    try:
+        print(f"\n{'='*60}")
+        print(f"📝 Creating agent: {request.agent_name}")
+        print(f"{'='*60}")
+        
+        # Store in Supabase
+        db_result = supabase.table("agents").insert({
+            "user_id": request.user_id,
+            "agent_name": request.agent_name,
+            "strategy_description": request.strategy_description,
+            "initialization_code": request.initialization_code,
+            "trigger_code": request.trigger_code,
+            "execution_code": request.execution_code,
+            "hyperliquid_address": request.hyperliquid_address,
+            "status": "stopped",
+            "agent_deployed": False,
+            "instruction": "RUN"
+        }).execute()
+        
+        agent_id = db_result.data[0]["id"]
+        
+        print(f"✅ Agent created in Supabase: {agent_id}")
+        print(f"{'='*60}\n")
+        
+        return CreateAgentResponse(
+            success=True,
+            agent_id=agent_id,
+            message=f"Agent '{request.agent_name}' created successfully with ID: {agent_id}"
+        )
+        
+    except Exception as e:
+        print(f"❌ Failed: {str(e)}")
+        print(f"{'='*60}\n")
+        return CreateAgentResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+@app.post("/run-agent", response_model=RunAgentResponse)
+async def run_agent(request: RunAgentRequest):
+    """
+    Run an agent using agentRunner (spawns a subprocess)
+    """
+    try:
+        import subprocess
+        import os
+        
+        print(f"\n{'='*60}")
+        print(f"🚀 Starting agent: {request.agent_id}")
+        print(f"{'='*60}")
+        
+        # Check if agent exists
+        agent_check = supabase.table("agents").select("id, agent_name, status").eq("id", request.agent_id).execute()
+        
+        if not agent_check.data or len(agent_check.data) == 0:
+            return RunAgentResponse(
+                success=False,
+                error=f"Agent {request.agent_id} not found in database"
+            )
+        
+        agent_data = agent_check.data[0]
+        agent_name = agent_data.get("agent_name", "Unknown")
+        
+        # Path to hyperliquid directory and agentRunner.js
+        hyperliquid_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hyperliquid")
+        agent_runner_path = os.path.join(hyperliquid_dir, "agentRunner.js")
+        
+        if not os.path.exists(agent_runner_path):
+            return RunAgentResponse(
+                success=False,
+                error=f"agentRunner.js not found at {agent_runner_path}"
+            )
+        
+        # Start agent in background
+        process = subprocess.Popen(
+            ["node", agent_runner_path, request.agent_id],
+            cwd=hyperliquid_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True  # Detach from parent process
+        )
+        
+        print(f"✅ Agent started with PID: {process.pid}")
+        print(f"   Agent: {agent_name}")
+        print(f"   ID: {request.agent_id}")
+        print(f"{'='*60}\n")
+        
+        return RunAgentResponse(
+            success=True,
+            agent_id=request.agent_id,
+            message=f"Agent '{agent_name}' started successfully",
+            pid=process.pid
+        )
+        
+    except Exception as e:
+        print(f"❌ Failed: {str(e)}")
+        print(f"{'='*60}\n")
+        return RunAgentResponse(
             success=False,
             error=str(e)
         )
