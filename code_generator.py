@@ -168,29 +168,39 @@ class CodeGenerator:
     ) -> Dict[str, str]:
         """
         Generate all three method bodies for a complete agent in one unified call.
-        This ensures cohesion across all methods.
+        
+        Pipeline:
+        1. Generate code (retry up to max_retries on JSON/generation failures)
+        2. Run syntax + lint checks
+        3. If issues found, invoke AI guardrail ONCE to fix them
+        4. Re-validate corrected code (full syntax + lint, not syntax-only)
+        5. Return the best code available
         """
         
         print("🤖 Generating agent code...")
         print(f"Strategy: {strategy_description[:100]}...")
         
-        # Build user prompt with all context
+        # Build user prompt
         user_prompt = UNIFIED_GENERATION_PROMPT.format(
             strategy_description=strategy_description,
         )
         
-        # Generate code with retries
+        last_errors = None  # Track errors across retries for context
+        
         for attempt in range(self.max_retries):
             try:
                 print(f"\n📝 Generation attempt {attempt + 1}/{self.max_retries}...")
                 
-                # Generate all three methods in one call
+                # Build the generation prompt, including error context from prior attempts
+                generation_prompt = user_prompt
+                if last_errors and attempt > 0:
+                    generation_prompt += f"\n\n## Previous Attempt Failed\nThe prior generation had these issues — avoid them:\n{last_errors}"
+                
                 response = await self.ai_provider.generate_with_json(
                     system_prompt=SYSTEM_PROMPT,
-                    user_prompt=user_prompt
+                    user_prompt=generation_prompt
                 )
                 
-                # Extract the three code sections
                 initialization_code = response.get("initialization_code", "")
                 trigger_code = response.get("trigger_code", "")
                 execution_code = response.get("execution_code", "")
@@ -200,183 +210,140 @@ class CodeGenerator:
                 
                 print("✅ Code generated successfully")
                 
-                # Validate if enabled
-                if self.validate:
-                    print("\n🔍 Validating generated code...")
-                    is_valid, corrected_code, lint_summary = await self._validate_code(
-                        initialization_code,
-                        trigger_code,
-                        execution_code
+                if not self.validate:
+                    return {
+                        "initialization_code": initialization_code,
+                        "trigger_code": trigger_code,
+                        "execution_code": execution_code,
+                        "strategy_description": strategy_description,
+                    }
+                
+                # --- Validation pipeline (runs once per generation attempt) ---
+                print("\n🔍 Validating generated code...")
+                syntax_errors, lint_errors = self._run_checks(
+                    initialization_code, trigger_code, execution_code
+                )
+                
+                error_count = len(syntax_errors)
+                warning_count = len(lint_errors)
+                print(f"\n📊 Validation: {error_count} syntax errors, {warning_count} lint warnings")
+                
+                # If clean, return immediately
+                if not syntax_errors and not lint_errors:
+                    print("✅ Code passed all checks")
+                    return {
+                        "initialization_code": initialization_code,
+                        "trigger_code": trigger_code,
+                        "execution_code": execution_code,
+                        "strategy_description": strategy_description,
+                    }
+                
+                # --- Guardrail: invoke ONCE to attempt correction ---
+                print("\n🤖 Invoking AI guardrail for corrections (single pass)...")
+                try:
+                    corrected_code = await self._invoke_guardrail(
+                        initialization_code, trigger_code, execution_code,
+                        syntax_errors, lint_errors
                     )
                     
-                    if is_valid:
-                        print("✅ Code validation passed")
-                        if corrected_code:
-                            # Use corrected code if provided
-                            initialization_code = corrected_code.get("initialization_code") or initialization_code
-                            trigger_code = corrected_code.get("trigger_code") or trigger_code
-                            execution_code = corrected_code.get("execution_code") or execution_code
+                    if corrected_code:
+                        # Merge corrections with originals
+                        final_init = corrected_code.get("initialization_code") or initialization_code
+                        final_trigger = corrected_code.get("trigger_code") or trigger_code
+                        final_exec = corrected_code.get("execution_code") or execution_code
                         
-                        return {
-                            "initialization_code": initialization_code,
-                            "trigger_code": trigger_code,
-                            "execution_code": execution_code,
-                            "strategy_description": strategy_description,
-                        }
-                    elif attempt < self.max_retries - 1:
-                        print(f"⚠️  Validation failed: {lint_summary}")
-                        print(f"🔄 Retrying with corrections...")
+                        # Re-validate corrected code (FULL check, not syntax-only)
+                        re_syntax, re_lint = self._run_checks(final_init, final_trigger, final_exec)
                         
-                        # If validator provided corrections, use them
-                        if corrected_code and any(corrected_code.values()):
-                            print("✅ Using auto-corrected code")
+                        if not re_syntax:
+                            print("✅ Corrected code passed syntax checks")
+                            if re_lint:
+                                print(f"⚠️  {len(re_lint)} lint warnings remain (non-blocking)")
                             return {
-                                "initialization_code": corrected_code.get("initialization_code") or initialization_code,
-                                "trigger_code": corrected_code.get("trigger_code") or trigger_code,
-                                "execution_code": corrected_code.get("execution_code") or execution_code,
+                                "initialization_code": final_init,
+                                "trigger_code": final_trigger,
+                                "execution_code": final_exec,
                                 "strategy_description": strategy_description,
                             }
-                        # Otherwise retry generation
-                        continue
+                        else:
+                            print("⚠️  Corrected code still has syntax errors")
+                            # Record errors for next retry
+                            last_errors = "Syntax: " + "; ".join(re_syntax)
+                            if re_lint:
+                                last_errors += "\nLint: " + "; ".join(re_lint)
                     else:
-                        print("⚠️  Max retries reached, returning unvalidated code")
-                        return {
-                            "initialization_code": initialization_code,
-                            "trigger_code": trigger_code,
-                            "execution_code": execution_code,
-                            "strategy_description": strategy_description,
-                        }
+                        last_errors = "Syntax: " + "; ".join(syntax_errors) if syntax_errors else ""
+                        if lint_errors:
+                            last_errors += "\nLint: " + "; ".join(lint_errors)
+                        
+                except Exception as e:
+                    print(f"⚠️  Guardrail error: {str(e)}")
+                    last_errors = "Syntax: " + "; ".join(syntax_errors) if syntax_errors else ""
                 
-                # If validation disabled, return immediately
-                return {
-                    "initialization_code": initialization_code,
-                    "trigger_code": trigger_code,
-                    "execution_code": execution_code,
-                    "strategy_description": strategy_description,
-                }
+                # If no syntax errors (only lint warnings), accept the code
+                if not syntax_errors:
+                    print("✅ No syntax errors — accepting with lint warnings")
+                    return {
+                        "initialization_code": initialization_code,
+                        "trigger_code": trigger_code,
+                        "execution_code": execution_code,
+                        "strategy_description": strategy_description,
+                    }
+                
+                # Syntax errors remain — retry generation with error context
+                if attempt < self.max_retries - 1:
+                    print(f"🔄 Retrying generation with error context...")
+                    continue
+                else:
+                    print("⚠️  Max retries reached, returning best available code")
+                    return {
+                        "initialization_code": initialization_code,
+                        "trigger_code": trigger_code,
+                        "execution_code": execution_code,
+                        "strategy_description": strategy_description,
+                    }
                 
             except json.JSONDecodeError as e:
                 print(f"❌ JSON parsing error: {str(e)}")
+                last_errors = f"JSON parse error: {str(e)}"
                 if attempt == self.max_retries - 1:
                     raise Exception(f"Failed to parse JSON response after {self.max_retries} attempts")
                 continue
                 
             except Exception as e:
+                print(f"⚠️  Attempt {attempt + 1} failed: {str(e)}")
+                last_errors = str(e)
                 if attempt == self.max_retries - 1:
                     raise Exception(f"Failed to generate agent code after {self.max_retries} attempts: {str(e)}")
-                print(f"⚠️  Attempt {attempt + 1} failed: {str(e)}")
                 continue
         
         raise Exception("Failed to generate valid agent code")
     
-    async def _validate_code(
+    def _run_checks(
         self,
         initialization_code: str,
         trigger_code: str,
         execution_code: str
-    ) -> Tuple[bool, Optional[Dict[str, str]], Dict[str, int]]:
+    ) -> Tuple[List[str], List[str]]:
         """
-        Validate generated code with comprehensive linting and guardrails.
-        Returns: (is_valid, corrected_code, lint_summary)
+        Run syntax + lint checks on all three code sections.
+        Returns: (syntax_errors, lint_errors)
         """
-        
-        print("\n🔍 Validating generated code...")
-        
-        # Combine all code for comprehensive validation
-        full_code = f"""
-// Initialization
-{initialization_code}
-
-// Triggers
-{trigger_code}
-
-// Execution
-{execution_code}
-"""
-        
-        # Step 1: Syntax check
         syntax_errors = []
-        syntax_err_init = _syntax_check(initialization_code)
-        if syntax_err_init:
-            syntax_errors.append(f"Initialization: {syntax_err_init}")
-        
-        syntax_err_trigger = _syntax_check(trigger_code)
-        if syntax_err_trigger:
-            syntax_errors.append(f"Triggers: {syntax_err_trigger}")
-        
-        syntax_err_exec = _syntax_check(execution_code)
-        if syntax_err_exec:
-            syntax_errors.append(f"Execution: {syntax_err_exec}")
-        
-        # Step 2: Lint check
         lint_errors = []
-        lint_err_init = _lint_check(initialization_code)
-        if lint_err_init:
-            lint_errors.append(f"Initialization:\n{lint_err_init}")
         
-        lint_err_trigger = _lint_check(trigger_code)
-        if lint_err_trigger:
-            lint_errors.append(f"Triggers:\n{lint_err_trigger}")
-        
-        lint_err_exec = _lint_check(execution_code)
-        if lint_err_exec:
-            lint_errors.append(f"Execution:\n{lint_err_exec}")
-        
-        # Count errors
-        error_count = len(syntax_errors)
-        warning_count = len(lint_errors)
-        
-        lint_summary = {
-            "error_count": error_count,
-            "warning_count": warning_count,
-            "suggestion_count": 0
-        }
-        
-        print(f"\n📊 Validation Summary:")
-        print(f"  Syntax Errors: {error_count}")
-        print(f"  Lint Warnings: {warning_count}")
-        
-        # If we have errors, invoke AI guardrail
-        if syntax_errors or lint_errors:
-            print("\n🤖 Invoking AI guardrail for corrections...")
+        for label, code in [("Initialization", initialization_code), 
+                            ("Triggers", trigger_code), 
+                            ("Execution", execution_code)]:
+            err = _syntax_check(code)
+            if err:
+                syntax_errors.append(f"{label}: {err}")
             
-            try:
-                corrected_code = await self._invoke_guardrail(
-                    initialization_code,
-                    trigger_code,
-                    execution_code,
-                    syntax_errors,
-                    lint_errors
-                )
-                
-                if corrected_code:
-                    print("✅ AI guardrail provided corrections")
-                    # Re-validate corrected code
-                    revalidated = await self._quick_validate(
-                        corrected_code.get("initialization_code", initialization_code),
-                        corrected_code.get("trigger_code", trigger_code),
-                        corrected_code.get("execution_code", execution_code)
-                    )
-                    
-                    if revalidated:
-                        print("✅ Corrected code passed validation")
-                        return True, corrected_code, lint_summary
-                    else:
-                        print("⚠️  Corrected code still has issues, but accepting it")
-                        return True, corrected_code, lint_summary
-                        
-            except Exception as e:
-                print(f"⚠️  Guardrail error: {str(e)}")
+            lint_err = _lint_check(code)
+            if lint_err:
+                lint_errors.append(f"{label}:\n{lint_err}")
         
-        # If only warnings (no syntax errors), consider it valid
-        is_valid = error_count == 0
-        
-        if is_valid:
-            print("✅ Code validation passed")
-        else:
-            print(f"❌ Code validation failed with {error_count} errors")
-        
-        return is_valid, None, lint_summary
+        return syntax_errors, lint_errors
     
     async def _invoke_guardrail(
         self,
@@ -387,65 +354,21 @@ class CodeGenerator:
         lint_errors: List[str]
     ) -> Optional[Dict[str, str]]:
         """
-        AI-powered code correction and refinement.
-        Similar to the guardrail in coder.py but for trading agents.
+        AI-powered code correction using the VALIDATION_PROMPT.
+        Invoked at most ONCE per generation attempt.
         """
         
-        system_prompt = """
-You are a JavaScript code specialist for trading agent corrections.
-
-Your job is to fix syntax and logic errors in trading agent code while maintaining the original intent.
-
-The code has three parts:
-1. initialization_code - Sets up strategy parameters
-2. trigger_code - Registers trading triggers
-3. execution_code - Executes trades when triggered
-
-CRITICAL RULES:
-- Fix ALL syntax errors
-- Address lint warnings (missing await, error handling, safety checks)
-- Do NOT change the strategy logic unnecessarily
-- Ensure all async functions use await
-- Always check result.success after order placement
-- Always call syncPositions() after trades
-- Always call updateState() for user communication
-- Always call checkSafetyLimits() before placing orders
-- Use proper try-catch error handling
-- Maintain cohesion between the three code sections
-- Variables set in initialization MUST be used in triggers and execution
-
-Ignore undefined-reference errors for these (they're pre-defined):
-- this.orderExecutor, this.wsManager, this.supabase
-- this.coin, this.userAddress, this.agentId, this.userId
-- this.maxPositionSize, this.dailyLossLimit
-- Helper functions from perpMarket.js and perpUser.js
-
-Output ONLY valid JSON with this structure:
-{{
-  "initialization_code": "<corrected code or null>",
-  "trigger_code": "<corrected code or null>",
-  "execution_code": "<corrected code or null>"
-}}
-
-Only include fields that need correction. If a section is fine, set it to null.
-"""
+        # Use the actual VALIDATION_PROMPT so the guardrail has the same rules as validation
+        validation_user_prompt = VALIDATION_PROMPT.format(
+            initialization_code=initialization_code,
+            trigger_code=trigger_code,
+            execution_code=execution_code
+        )
         
-        user_prompt = f"""Fix the following trading agent code:
+        # Append the specific errors found
+        validation_user_prompt += f"""
 
-INITIALIZATION CODE:
-```javascript
-{initialization_code}
-```
-
-TRIGGER CODE:
-```javascript
-{trigger_code}
-```
-
-EXECUTION CODE:
-```javascript
-{execution_code}
-```
+## Detected Issues to Fix
 
 SYNTAX ERRORS:
 {chr(10).join(syntax_errors) if syntax_errors else 'None'}
@@ -453,97 +376,28 @@ SYNTAX ERRORS:
 LINT WARNINGS:
 {chr(10).join(lint_errors) if lint_errors else 'None'}
 
-Provide corrected code for sections that need fixes. Return null for sections that are fine.
-"""
-        
-        try:
-            response = await self.ai_provider.generate_with_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt
-            )
-            
-            # Extract corrections
-            corrected = {}
-            if response.get("initialization_code"):
-                corrected["initialization_code"] = response["initialization_code"]
-            if response.get("trigger_code"):
-                corrected["trigger_code"] = response["trigger_code"]
-            if response.get("execution_code"):
-                corrected["execution_code"] = response["execution_code"]
-            
-            return corrected if corrected else None
-            
-        except Exception as e:
-            print(f"⚠️  Guardrail invocation failed: {str(e)}")
-            return None
-    
-    async def _quick_validate(
-        self,
-        initialization_code: str,
-        trigger_code: str,
-        execution_code: str
-    ) -> bool:
-        """Quick syntax validation without full lint check."""
-        
-        syntax_ok = (
-            _syntax_check(initialization_code) is None and
-            _syntax_check(trigger_code) is None and
-            _syntax_check(execution_code) is None
-        )
-        
-        return syntax_ok
-    
-    async def regenerate_method(
-        self,
-        method_type: str,  # 'init', 'triggers', or 'execution'
-        strategy_description: str,
-        strategy_config: Dict[str, Any],
-        current_code: Dict[str, str]
-    ) -> str:
-        """
-        Regenerate a specific method while keeping others intact.
-        Uses the unified prompt but focuses on one method.
-        """
-        
-        print(f"🔄 Regenerating {method_type} method...")
-        
-        # Build focused prompt
-        user_prompt = f"""Regenerate ONLY the {method_type} method for this agent.
-
-Strategy: {strategy_description}
-Config: {json.dumps(strategy_config, indent=2)}
-
-Current initialization code:
-```javascript
-{current_code.get('initialization_code', '')}
-```
-
-Current trigger code:
-```javascript
-{current_code.get('trigger_code', '')}
-```
-
-Current execution code:
-```javascript
-{current_code.get('execution_code', '')}
-```
-
-Generate a replacement for the {method_type} method that maintains cohesion with the other methods.
-Respond with JSON: {{"code": "// new code here"}}
+Fix all errors and provide corrected_code. Set fields to null if no changes needed for that section.
 """
         
         try:
             response = await self.ai_provider.generate_with_json(
                 system_prompt=SYSTEM_PROMPT,
-                user_prompt=user_prompt
+                user_prompt=validation_user_prompt
             )
             
-            new_code = response.get("code", "")
-            if not new_code:
-                raise ValueError("No code in response")
+            # The response follows VALIDATION_PROMPT format
+            corrected = response.get("corrected_code", {})
+            if not corrected or not isinstance(corrected, dict):
+                return None
             
-            print(f"✅ {method_type} method regenerated")
-            return new_code
+            # Filter out null entries
+            result = {}
+            for key in ["initialization_code", "trigger_code", "execution_code"]:
+                if corrected.get(key):
+                    result[key] = corrected[key]
+            
+            return result if result else None
             
         except Exception as e:
-            raise Exception(f"Failed to regenerate {method_type}: {str(e)}")
+            print(f"⚠️  Guardrail invocation failed: {str(e)}")
+            return None
