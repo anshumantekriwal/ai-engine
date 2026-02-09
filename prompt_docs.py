@@ -10,6 +10,22 @@ OrderExecutor Class (pre-initialized as `this.orderExecutor`):
 Uses Hyperliquid API Wallet system. Main user address for queries, API wallet for signing.
 Already initialized — just call the methods.
 
+### CRITICAL: Multi-Agent Sandboxing
+
+Multiple agents may share the SAME Hyperliquid account. The exchange sees ONE account with ONE position
+per coin. Your agent MUST NOT interfere with other agents:
+
+- **Positions are account-wide.** `getPositions("BTC")` returns the account's TOTAL BTC position, which
+  may include size from OTHER agents. Never assume the entire position belongs to you.
+- **Use `closePosition(coin, size)` with an explicit `size` for partial closes.** Never call
+  `closePosition(coin)` (full close) unless your strategy truly owns the entire position. Track your
+  own entry size and close exactly that amount.
+- **Use `cancelAgentOrders(coin)` instead of `cancelAllOrders(coin)`.** `cancelAllOrders` cancels
+  EVERY open order for that coin on the account (including other agents' SL/TP orders).
+  `cancelAgentOrders` only cancels orders placed by THIS agent.
+- **Track your own positions locally** using `this.tradeState` or similar. Don't rely solely on
+  `getPositions()` to know your exposure — it's the whole account.
+
 ### Order Placement Methods
 
 1. placeMarketOrder(coin, isBuy, size, reduceOnly=false, slippage=0.05)
@@ -57,23 +73,46 @@ Already initialized — just call the methods.
    - Same isBuy logic: false for trailing stop on longs, true for shorts.
    - trailPercent: e.g., 5 = 5% trailing distance from peak/trough.
 
-6. closePosition(coin, slippage=0.05)
-   - Closes entire position via market order. Automatically determines buy/sell direction.
+6. closePosition(coin, size=null, slippage=0.05)
+   - Closes a position via market order. Automatically determines buy/sell direction.
+   - size=null: closes ENTIRE position. size=number: partial close (clamped to position size).
    - Returns same OrderResult: { success, orderId, filledSize, averagePrice, status, error }
    - NOTE: Does NOT have a `realizedPnl` field. To get PnL, calculate from entry/exit prices.
    - Returns { success: false, error: "No open position for {coin}" } if no position exists.
+   - **IMPORTANT (Sandboxing):** In multi-agent setups, ALWAYS pass your tracked size explicitly to
+     avoid closing another agent's portion of the position:
+     ```
+     // GOOD: Close only what this agent opened
+     const mySize = this.tradeState[coin].entrySize;
+     await this.orderExecutor.closePosition(coin, mySize);
 
-7. cancelOrder(coin, orderId) — orderId must be number (use parseInt() if string)
+     // BAD: Closes the ENTIRE account position (may include other agents)
+     await this.orderExecutor.closePosition(coin);
+     ```
+   - Examples:
+     ```
+     await this.orderExecutor.closePosition("BTC", 0.005);        // partial close 0.005 BTC
+     await this.orderExecutor.closePosition("ETH", null, 0.02);   // full close, 2% slippage
+     await this.orderExecutor.closePosition("BTC", myTrackedSize); // close exactly your size
+     ```
 
-8. cancelAllOrders(coin) — coin is REQUIRED. Loop coins to cancel all.
+7. cancelOrder(coin, orderId) — orderId must be number
+
+8. cancelAgentOrders(coin=null) — **PREFERRED for multi-agent.** Only cancels orders placed by THIS agent.
+   - Uses local ownership tracking. Safe on shared accounts.
+   - coin=null cancels all owned orders across all coins.
+   - Returns OrderResult with status "all_owned_orders_cancelled" or "no_owned_orders_to_cancel".
+
+9. cancelAllOrders(coin) — **WARNING: Account-wide.** Cancels ALL open orders for the coin, including
+   other agents' SL/TP orders. Use `cancelAgentOrders()` instead unless you intend to nuke everything.
 
 ### Leverage & Query Methods
 
-9. setLeverage(coin, leverage, isCross=true)
+10. setLeverage(coin, leverage, isCross=true)
    - Auto-capped at coin's max allowed leverage. Call in onInitialize() BEFORE orders.
    - Default 20x if not set. isCross=true for cross margin, false for isolated.
 
-10. getPositions(coin=null)
+11. getPositions(coin=null)
     - Returns: Position[] — { coin, size, entryPrice, unrealizedPnl, realizedPnl, leverage, liquidationPrice, marginUsed }
     - size: positive = long, negative = short. Positions with size=0 are filtered out.
     - Returns EMPTY ARRAY [] if no position exists (not [{size:0}]).
@@ -87,21 +126,21 @@ Already initialized — just call the methods.
       }
       ```
 
-11. getAccountValue() — Returns total account value in USD (number).
+12. getAccountValue() — Returns total account value in USD (number).
 
-12. getAvailableBalance() — Returns available balance not in positions (number).
+13. getAvailableBalance() — Returns available balance not in positions (number).
 
-13. getOpenOrders(coin=null)
+14. getOpenOrders(coin=null)
     - Returns: OpenOrder[] — { orderId, coin, side, size, price, orderType, reduceOnly, timestamp }
 
-14. getMaxTradeSizes(coin) — Returns { maxLong, maxShort } based on balance and current leverage.
+15. getMaxTradeSizes(coin) — Returns { maxLong, maxShort } based on balance and current leverage.
 
-15. getMaxLeverage(coin) — Returns max leverage from exchange metadata (e.g., 50 for BTC).
+16. getMaxLeverage(coin) — Returns max leverage from exchange metadata (e.g., 50 for BTC).
 
 ### Critical Usage Rules
 
 - ALWAYS check `result.success` before accessing fill data.
-- Position sizes auto-rounded to valid decimals per coin. Prices rounded to 5 sig figs.
+- Position sizes auto-rounded to valid decimals per coin. Prices rounded to 5 sig figs AND max (6-szDecimals) decimal places.
 - Rate limiting handled automatically with exponential backoff.
 - reduceOnly=true means order can ONLY close/reduce, not open.
 - Positive size = long, negative = short.
@@ -253,8 +292,8 @@ BaseAgent Class (your code runs inside this):
 - `this.userId` (string): Owner user ID
 - `this.privateKey` (string): Hyperliquid API wallet key (0x-prefixed)
 - `this.userAddress` (string): User's main Hyperliquid address (0x-prefixed)
-- `this.isMainnet` (boolean): Always true
-- `this.orderExecutor` (OrderExecutor): Trading operations
+- `this.isMainnet` (boolean): Network flag
+- `this.orderExecutor` (OrderExecutor): Trading operations (sandbox-aware, tracks order ownership)
 - `this.wsManager` (HyperliquidWSManager): WebSocket data streams
 - `this.supabase` (SupabaseClient): Database (rarely needed directly)
 - `this.currentState` (string): 'initializing'|'running'|'stopped'|'error'
@@ -264,12 +303,21 @@ BaseAgent Class (your code runs inside this):
 ### State Management
 
 updateState(stateType, stateData, message)
-  - stateType: string (e.g., 'init', 'order_executed', 'error', 'skip_duplicate', 'external_close')
+  - stateType: string (e.g., 'init', 'order_executed', 'error', 'skip_duplicate', 'external_close',
+    'cycle_summary', 'no_action', 'trigger_check')
   - stateData: object (JSONB, stored in Supabase)
-  - message: string — human-readable summary of WHAT happened and WHY. This is what appears in
-    the dashboard. Make it descriptive:
+  - message: string — **THIS IS THE AGENT'S ONLY WAY TO COMMUNICATE WITH THE USER.** The user sees
+    ONLY these messages in their dashboard. Every message must be a complete, natural-language sentence
+    explaining WHAT happened, WHY, and WHAT COMES NEXT.
     Good: "BTC LONG: 0.001 BTC @ $95,230 (5x lev, RSI=28.5, SL=$93,417 TP=$97,148)"
+    Good: "Checked all triggers — no conditions met. BTC RSI=45.2 (need <30), ETH RSI=52.1 (need <30). Will check again in 5 minutes."
+    Good: "Skipped BTC buy — already have an active position from this RSI excursion (entered @ $94,100). Waiting for RSI to reset above 50."
     Bad: "order executed"
+    Bad: "no action"
+    Bad: "checking..."
+  - **MANDATORY:** Call updateState at EVERY decision point, including when nothing happens. The user
+    must never wonder "is my agent still working?" Silence = anxiety. Regular heartbeat updates
+    build trust.
 
 syncPositions()
   - Fetches ALL current positions from Hyperliquid and upserts to `agent_positions` table.

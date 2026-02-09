@@ -139,6 +139,25 @@ def _lint_check(js_code: str) -> Optional[str]:
         if 'checkSafetyLimits' not in js_code:
             errors.append("Missing `checkSafetyLimits()` check before placing orders")
 
+    # 9) Sandboxing: cancelAllOrders should be cancelAgentOrders
+    if 'cancelAllOrders' in js_code:
+        errors.append("Using `cancelAllOrders()` — this cancels ALL orders on the account (including other agents). Use `cancelAgentOrders()` instead for sandboxed cancellation")
+
+    # 10) Sandboxing: closePosition without explicit size
+    # Look for closePosition(coin) without a second argument (bare close = full account close)
+    bare_close = re.findall(r'closePosition\(\s*(?:this\.\w+|\w+|["\'][^"\']+["\'])\s*\)', js_code)
+    if bare_close:
+        # Filter out cases that already have a size argument (comma after first arg)
+        for match in bare_close:
+            if ',' not in match:
+                errors.append(f"Bare `closePosition(coin)` without explicit size — this closes the ENTIRE account position. Pass your tracked entrySize: `closePosition(coin, mySize)`")
+                break
+
+    # 11) Sandboxing: check that entrySize is tracked after placing orders
+    if 'placeMarketOrder' in js_code:
+        if 'entrySize' not in js_code and 'entry_size' not in js_code:
+            errors.append("Not tracking `entrySize` after opening positions — agent won't know how much to close later. Store `this.tradeState[coin].entrySize = filled` after entry")
+
     if errors:
         print(f"❌ Lint issues found ({len(errors)}):")
         for err in errors:
