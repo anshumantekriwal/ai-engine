@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
     print(f"Provider: {AI_PROVIDER.upper()}")
     print(f"Model: {AI_MODEL}")
-    print(f"Validation: {'Enabled' if VALIDATION_ENABLED else 'Disabled'}")
+    print(f"Validation: {'enabled' if VALIDATION_ENABLED else 'disabled'}")
     print("=" * 60)
     yield
     # Shutdown (if needed)
@@ -62,7 +62,6 @@ supabase: Client = create_client(
 # AI Configuration
 AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").lower()
 AI_MODEL = os.getenv("AI_MODEL", None)
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 VALIDATION_ENABLED = os.getenv("VALIDATION_ENABLED", "true").lower() == "true"
 
 # Get API key based on provider
@@ -90,7 +89,6 @@ ai_provider = get_provider(
 )
 code_generator = CodeGenerator(
     ai_provider=ai_provider,
-    max_retries=MAX_RETRIES,
     validate=VALIDATION_ENABLED
 )
 
