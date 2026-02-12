@@ -304,7 +304,7 @@ this.registerScheduledTrigger(this.checkInterval, async (triggerData) => {{
   await this.executeTrade({{ ...triggerData, action: 'analyze' }});
 }});
 
-// In executeTrade():
+// In executeTrade(): 
 if (action === 'analyze') {{
   for (const coin of this.coins) {{
     const now = Date.now();
