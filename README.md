@@ -14,6 +14,7 @@ Comprehensive AI-powered code generation system for Hyperliquid trading agents u
 - ✅ **Supabase Integration**: Direct storage of generated agents
 - ✅ **RESTful API**: Easy integration with frontend
 - ✅ **JSON Output**: Structured response format for parsing
+- ✅ **Spec/Hybrid Generation**: Generates validated `strategy_spec` for declarative runtime
 
 ## Architecture
 
@@ -102,6 +103,12 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 ### API Endpoints
+
+#### Hybrid/Spec Endpoints
+```bash
+POST /generate-spec
+POST /spec/validate
+```
 
 #### 1. Generate Complete Agent
 ```bash
@@ -305,11 +312,8 @@ The system includes comprehensive error handling:
 ## Testing
 
 ```bash
-# Test the server
-curl http://localhost:8000/health
-
-# Test code generation
-python test_generator.py
+# Run ai-engine regressions
+./scripts/run-regression.sh
 ```
 
 ## Deployment

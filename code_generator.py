@@ -14,7 +14,8 @@ import re
 from ai_providers import AIProvider
 from prompts import (
     SYSTEM_PROMPT,
-    UNIFIED_GENERATION_PROMPT,
+    SYSTEM_PROMPT_WITH_EXAMPLES,
+    build_user_prompt_for_generation,
     VALIDATION_PROMPT
 )
 
@@ -195,17 +196,15 @@ class CodeGenerator:
         print("🤖 Generating agent code...")
         print(f"Strategy: {strategy_description[:100]}...")
 
-        # Build user prompt
-        user_prompt = UNIFIED_GENERATION_PROMPT.format(
-            strategy_description=strategy_description,
-        )
+        # Build user prompt with just the strategy (system prompt is cached with examples)
+        user_prompt = build_user_prompt_for_generation(strategy_description)
 
         # --- Step 1: Generate code ---
         print("\n📝 Generating code...")
 
         response = await self.ai_provider.generate_with_json(
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=user_prompt
+            user_prompt=user_prompt,
+            system_prompt=SYSTEM_PROMPT_WITH_EXAMPLES
         )
 
         initialization_code = response.get("initialization_code", "")
@@ -305,7 +304,6 @@ Fix everything and provide corrected_code. Set fields to null if no changes need
 
         try:
             response = await self.ai_provider.generate_with_json(
-                system_prompt=SYSTEM_PROMPT,
                 user_prompt=validation_user_prompt
             )
 

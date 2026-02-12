@@ -9,13 +9,15 @@ Endpoints:
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from ai_providers import get_provider
 from code_generator import CodeGenerator
+from strategy_spec_generator import StrategySpecGenerator
+from strategy_spec_schema import validate_strategy_spec
 
 from contextlib import asynccontextmanager
 
@@ -91,6 +93,11 @@ code_generator = CodeGenerator(
     ai_provider=ai_provider,
     validate=VALIDATION_ENABLED
 )
+strategy_spec_generator = StrategySpecGenerator(
+    ai_provider=ai_provider,
+    validate=VALIDATION_ENABLED,
+    code_generator=code_generator
+)
 
 
 # ============================================================================
@@ -125,14 +132,37 @@ class GenerateRequest(BaseModel):
         }
 
 
+class GenerateSpecRequest(BaseModel):
+    """Request for strategy_spec generation"""
+    strategy_description: str = Field(..., description="Trading strategy description")
+    include_code_fallback: bool = Field(
+        False,
+        description="Also generate JS fallback code bundle"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "strategy_description": "Buy BTC when RSI(14,1h) drops below 30 and sell above 70. Use 5x leverage.",
+                "include_code_fallback": True
+            }
+        }
+
+
 class CreateAgentRequest(BaseModel):
     """Request to create agent in Supabase from generated code"""
     user_id: str = Field(..., description="User ID")
     agent_name: str = Field(..., description="Agent name")
     strategy_description: str = Field(..., description="Trading strategy description")
-    initialization_code: str = Field(..., description="Initialization code")
-    trigger_code: str = Field(..., description="Trigger code")
-    execution_code: str = Field(..., description="Execution code")
+    initialization_code: Optional[str] = Field("", description="Initialization code")
+    trigger_code: Optional[str] = Field("", description="Trigger code")
+    execution_code: Optional[str] = Field("", description="Execution code")
+    strategy_spec: Optional[Dict[str, Any]] = Field(None, description="Declarative strategy spec payload")
+    strategy_runtime: Optional[str] = Field(
+        None,
+        description="Runtime mode override: code, spec, hybrid"
+    )
+    config: Optional[Dict[str, Any]] = Field(None, description="Additional config payload")
     hyperliquid_address: str = Field(..., description="Hyperliquid wallet address")
     
     class Config:
@@ -180,6 +210,15 @@ class GenerateResponse(BaseModel):
     error: Optional[str] = None
 
 
+class GenerateSpecResponse(BaseModel):
+    """Response from strategy_spec generation"""
+    success: bool
+    strategy_spec: Optional[Dict[str, Any]] = None
+    notes: Optional[Dict[str, Any]] = None
+    code_fallback: Optional[Dict[str, str]] = None
+    error: Optional[str] = None
+
+
 class CreateAgentResponse(BaseModel):
     """Response from agent creation"""
     success: bool
@@ -205,6 +244,15 @@ class StatusResponse(BaseModel):
     validation_enabled: bool
 
 
+class ValidateSpecRequest(BaseModel):
+    strategy_spec: Dict[str, Any] = Field(..., description="strategy_spec payload to validate")
+
+
+class ValidateSpecResponse(BaseModel):
+    valid: bool
+    errors: List[Dict[str, str]]
+
+
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
@@ -218,6 +266,13 @@ async def status():
         model=AI_MODEL,
         validation_enabled=VALIDATION_ENABLED
     )
+
+
+@app.post("/spec/validate", response_model=ValidateSpecResponse)
+async def validate_spec(request: ValidateSpecRequest):
+    """Validate a strategy_spec payload against the tool contract."""
+    valid, errors = validate_strategy_spec(request.strategy_spec)
+    return ValidateSpecResponse(valid=valid, errors=errors)
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -250,6 +305,40 @@ async def generate_code_only(request: GenerateRequest):
         print(f"❌ Failed: {str(e)}")
         print(f"{'='*60}\n")
         return GenerateResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+@app.post("/generate-spec", response_model=GenerateSpecResponse)
+async def generate_strategy_spec(request: GenerateSpecRequest):
+    """
+    Generate strategy_spec payload for declarative/hybrid runtime.
+    Optionally include JS fallback code bundle.
+    """
+    try:
+        print(f"\n{'='*60}")
+        print("📥 Generating strategy_spec")
+        print(f"{'='*60}")
+
+        result = await strategy_spec_generator.generate_hybrid_bundle(
+            strategy_description=request.strategy_description,
+            include_code_fallback=request.include_code_fallback
+        )
+
+        print("✅ strategy_spec generated")
+        print(f"{'='*60}\n")
+
+        return GenerateSpecResponse(
+            success=True,
+            strategy_spec=result["strategy_spec"],
+            notes=result.get("notes", {}),
+            code_fallback=result.get("code_fallback")
+        )
+    except Exception as e:
+        print(f"❌ strategy_spec generation failed: {str(e)}")
+        print(f"{'='*60}\n")
+        return GenerateSpecResponse(
             success=False,
             error=str(e)
         )
@@ -314,19 +403,64 @@ async def create_agent(request: CreateAgentRequest):
         print(f"📝 Creating agent: {request.agent_name}")
         print(f"{'='*60}")
         
-        # Store in Supabase
-        db_result = supabase.table("agents").insert({
+        has_spec = request.strategy_spec is not None
+        has_code = all([
+            bool((request.initialization_code or "").strip()),
+            bool((request.trigger_code or "").strip()),
+            bool((request.execution_code or "").strip())
+        ])
+
+        if not has_spec and not has_code:
+            return CreateAgentResponse(
+                success=False,
+                error="Provide either strategy_spec or all three code sections"
+            )
+
+        strategy_runtime = request.strategy_runtime
+        if strategy_runtime is None:
+            strategy_runtime = "hybrid" if (has_spec and has_code) else ("spec" if has_spec else "code")
+
+        config_payload = dict(request.config or {})
+        if has_spec:
+            config_payload.setdefault("strategy_spec", request.strategy_spec)
+            config_payload.setdefault("strategy_runtime", strategy_runtime)
+
+        insert_payload = {
             "user_id": request.user_id,
             "agent_name": request.agent_name,
             "strategy_description": request.strategy_description,
-            "initialization_code": request.initialization_code,
-            "trigger_code": request.trigger_code,
-            "execution_code": request.execution_code,
+            "initialization_code": request.initialization_code or "",
+            "trigger_code": request.trigger_code or "",
+            "execution_code": request.execution_code or "",
             "hyperliquid_address": request.hyperliquid_address,
             "status": "stopped",
             "agent_deployed": False,
-            "instruction": "RUN"
-        }).execute()
+            "instruction": "RUN",
+            "config": config_payload if config_payload else None
+        }
+
+        if has_spec:
+            insert_payload["strategy_runtime"] = strategy_runtime
+            insert_payload["strategy_spec"] = request.strategy_spec
+            insert_payload["strategy_spec_version"] = request.strategy_spec.get("version")
+
+        # Store in Supabase. If newer columns do not exist yet, fallback to config-only storage.
+        try:
+            db_result = supabase.table("agents").insert(insert_payload).execute()
+        except Exception as insert_error:
+            error_str = str(insert_error)
+            if has_spec and (
+                "strategy_spec" in error_str
+                or "strategy_runtime" in error_str
+                or "strategy_spec_version" in error_str
+            ):
+                fallback_payload = dict(insert_payload)
+                fallback_payload.pop("strategy_runtime", None)
+                fallback_payload.pop("strategy_spec", None)
+                fallback_payload.pop("strategy_spec_version", None)
+                db_result = supabase.table("agents").insert(fallback_payload).execute()
+            else:
+                raise
         
         agent_id = db_result.data[0]["id"]
         
