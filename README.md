@@ -15,6 +15,7 @@ Comprehensive AI-powered code generation system for Hyperliquid trading agents u
 - ✅ **RESTful API**: Easy integration with frontend
 - ✅ **JSON Output**: Structured response format for parsing
 - ✅ **Spec/Hybrid Generation**: Generates validated `strategy_spec` for declarative runtime
+- ✅ **Backtest Spec Generation**: Generates validated backtest-tool `strategy_spec` from plain text
 
 ## Architecture
 
@@ -24,6 +25,9 @@ ai-engine/
 ├── code_generator.py      # Core unified generation logic
 ├── ai_providers.py        # AI provider abstractions (Claude/GPT)
 ├── prompts.py             # Comprehensive system and validation prompts
+├── backtest_spec_prompts.py    # Claude-optimized backtest few-shot prompts
+├── backtest_spec_schema.py     # Backtest strategy spec validator
+├── backtest_spec_generator.py  # Plaintext -> backtest spec generator
 ├── requirements.txt       # Python dependencies
 └── env.example            # Environment variables template
 ```
@@ -108,6 +112,8 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 ```bash
 POST /generate-spec
 POST /spec/validate
+POST /generate-backtest-spec
+POST /backtest-spec/validate
 ```
 
 #### 1. Generate Complete Agent

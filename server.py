@@ -3,6 +3,8 @@ FastAPI Server for AI Agent Code Generation
 
 Endpoints:
 - POST /code - Generate complete agent code and store in Supabase
+- POST /generate-backtest-spec - Generate backtest-tool-compatible strategy spec
+- POST /backtest-spec/validate - Validate backtest strategy spec payload
 - GET /status - Health check
 """
 
@@ -16,6 +18,8 @@ from supabase import create_client, Client
 
 from ai_providers import get_provider
 from code_generator import CodeGenerator
+from backtest_spec_generator import BacktestSpecGenerator
+from backtest_spec_schema import validate_backtest_spec
 from strategy_spec_generator import StrategySpecGenerator
 from strategy_spec_schema import validate_strategy_spec
 
@@ -98,6 +102,10 @@ strategy_spec_generator = StrategySpecGenerator(
     validate=VALIDATION_ENABLED,
     code_generator=code_generator
 )
+backtest_spec_generator = BacktestSpecGenerator(
+    ai_provider=ai_provider,
+    validate=VALIDATION_ENABLED
+)
 
 
 # ============================================================================
@@ -145,6 +153,18 @@ class GenerateSpecRequest(BaseModel):
             "example": {
                 "strategy_description": "Buy BTC when RSI(14,1h) drops below 30 and sell above 70. Use 5x leverage.",
                 "include_code_fallback": True
+            }
+        }
+
+
+class GenerateBacktestSpecRequest(BaseModel):
+    """Request for backtest strategy_spec generation"""
+    strategy_description: str = Field(..., description="Trading strategy description")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "strategy_description": "Trade BTC using EMA 9/21 crossover on 5m candles with 5x leverage and 4% stop loss."
             }
         }
 
@@ -219,6 +239,14 @@ class GenerateSpecResponse(BaseModel):
     error: Optional[str] = None
 
 
+class GenerateBacktestSpecResponse(BaseModel):
+    """Response from backtest strategy_spec generation"""
+    success: bool
+    strategy_spec: Optional[Dict[str, Any]] = None
+    notes: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
 class CreateAgentResponse(BaseModel):
     """Response from agent creation"""
     success: bool
@@ -253,6 +281,15 @@ class ValidateSpecResponse(BaseModel):
     errors: List[Dict[str, str]]
 
 
+class ValidateBacktestSpecRequest(BaseModel):
+    strategy_spec: Dict[str, Any] = Field(..., description="backtest strategy_spec payload to validate")
+
+
+class ValidateBacktestSpecResponse(BaseModel):
+    valid: bool
+    errors: List[Dict[str, str]]
+
+
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
@@ -273,6 +310,13 @@ async def validate_spec(request: ValidateSpecRequest):
     """Validate a strategy_spec payload against the tool contract."""
     valid, errors = validate_strategy_spec(request.strategy_spec)
     return ValidateSpecResponse(valid=valid, errors=errors)
+
+
+@app.post("/backtest-spec/validate", response_model=ValidateBacktestSpecResponse)
+async def validate_backtest_strategy_spec(request: ValidateBacktestSpecRequest):
+    """Validate a backtest strategy_spec payload against the backtest-tool contract."""
+    valid, errors = validate_backtest_spec(request.strategy_spec)
+    return ValidateBacktestSpecResponse(valid=valid, errors=errors)
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -339,6 +383,37 @@ async def generate_strategy_spec(request: GenerateSpecRequest):
         print(f"❌ strategy_spec generation failed: {str(e)}")
         print(f"{'='*60}\n")
         return GenerateSpecResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+@app.post("/generate-backtest-spec", response_model=GenerateBacktestSpecResponse)
+async def generate_backtest_strategy_spec(request: GenerateBacktestSpecRequest):
+    """
+    Generate backtest-tool-compatible strategy_spec payload from plain text strategy.
+    """
+    try:
+        print(f"\n{'='*60}")
+        print("📥 Generating backtest strategy_spec")
+        print(f"{'='*60}")
+
+        result = await backtest_spec_generator.generate_backtest_spec(
+            strategy_description=request.strategy_description
+        )
+
+        print("✅ backtest strategy_spec generated")
+        print(f"{'='*60}\n")
+
+        return GenerateBacktestSpecResponse(
+            success=True,
+            strategy_spec=result["strategy_spec"],
+            notes=result.get("notes", {}),
+        )
+    except Exception as e:
+        print(f"❌ backtest strategy_spec generation failed: {str(e)}")
+        print(f"{'='*60}\n")
+        return GenerateBacktestSpecResponse(
             success=False,
             error=str(e)
         )
