@@ -9,9 +9,17 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import json as _json
+import logging
+
 from ai_providers import AIProvider
 from backtest_spec_prompts import BACKTEST_SPEC_GENERATION_PROMPT, BACKTEST_SPEC_SYSTEM_PROMPT
-from backtest_spec_schema import assert_valid_backtest_spec
+from backtest_spec_schema import assert_valid_backtest_spec, validate_backtest_spec
+
+logger = logging.getLogger(__name__)
+
+# Maximum correction passes when the LLM output fails schema validation
+MAX_CORRECTION_ATTEMPTS = 2
 
 TIMEFRAME_ALIASES = {
     "1m": "1m",
@@ -189,7 +197,17 @@ def _normalize_order_type(value: Any, fallback: str = "market") -> str:
 
 def _infer_signal_kind(signal: Dict[str, Any]) -> str:
     if "kind" in signal and isinstance(signal["kind"], str):
-        return signal["kind"].strip().lower()
+        kind = signal["kind"].strip().lower()
+        # Normalize aliases
+        if kind in {"position_pnl", "pnl", "positionpnl"}:
+            return "position_pnl"
+        if kind in {"ranking", "rank"}:
+            return "ranking"
+        return kind
+    if "pnl_pct_above" in signal or "pnl_pct_below" in signal:
+        return "position_pnl"
+    if "rank_by" in signal:
+        return "ranking"
     if "indicator" in signal and "operator" in signal:
         return "threshold"
     if "fast" in signal and "slow" in signal:
@@ -206,10 +224,12 @@ def _normalize_indicator(value: Any) -> str:
         return "RSI"
     raw = value.strip()
     upper = raw.upper()
-    if upper in {"RSI", "EMA", "SMA", "MACD"}:
+    if upper in {"RSI", "EMA", "SMA", "MACD", "ATR", "ADX", "VWAP"}:
         return upper
     if upper in {"BOLLINGERBANDS", "BOLLINGER_BANDS", "BBANDS", "BOLLINGER"}:
         return "BollingerBands"
+    if upper in {"STOCHASTIC", "STOCH", "STOCHASTICS"}:
+        return "Stochastic"
     return raw
 
 
@@ -221,6 +241,22 @@ def _normalize_signal_action(value: Any, fallback: str = "buy") -> str:
         if lower in {"sell", "short"}:
             return "sell"
     return fallback
+
+
+def _normalize_gate(gate: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a signal gate object."""
+    normalized: Dict[str, Any] = {}
+    cooldown = _to_int(gate.get("cooldown_bars"))
+    if cooldown and cooldown > 0:
+        normalized["cooldown_bars"] = cooldown
+    max_fires = _to_int(gate.get("max_total_fires"))
+    if max_fires and max_fires > 0:
+        normalized["max_total_fires"] = max_fires
+    if "requires_no_position" in gate:
+        normalized["requires_no_position"] = _to_bool(gate["requires_no_position"], False)
+    if "requires_position" in gate:
+        normalized["requires_position"] = _to_bool(gate["requires_position"], False)
+    return normalized
 
 
 def _normalize_signals(signals: Any, timeframe: str) -> List[Dict[str, Any]]:
@@ -244,7 +280,8 @@ def _normalize_signals(signals: Any, timeframe: str) -> List[Dict[str, Any]]:
             signal["check_field"] = str(signal.get("check_field", "value"))
             signal["operator"] = str(signal.get("operator", "lt")).lower()
             signal["action"] = _normalize_signal_action(signal.get("action"), fallback="buy")
-            if signal["indicator"] in {"RSI", "EMA", "SMA", "BollingerBands"}:
+            # Period-based indicators
+            if signal["indicator"] in {"RSI", "EMA", "SMA", "BollingerBands", "ATR", "ADX", "VWAP", "Stochastic"}:
                 period = _to_int(signal.get("period"))
                 signal["period"] = period if period and period > 0 else 14
             if signal["indicator"] == "BollingerBands":
@@ -257,8 +294,18 @@ def _normalize_signals(signals: Any, timeframe: str) -> List[Dict[str, Any]]:
                 signal["fastPeriod"] = fp if fp and fp > 0 else 12
                 signal["slowPeriod"] = sp if sp and sp > 0 else 26
                 signal["signalPeriod"] = sigp if sigp and sigp > 0 else 9
+            if signal["indicator"] == "Stochastic":
+                sigp = _to_int(signal.get("signalPeriod"))
+                if sigp and sigp > 0:
+                    signal["signalPeriod"] = sigp
             value = _to_float(signal.get("value"))
             signal["value"] = value if value is not None else 0.0
+            # Normalize optional gate (pass through if dict)
+            if "gate" in signal and isinstance(signal["gate"], dict):
+                signal["gate"] = _normalize_gate(signal["gate"])
+            # Normalize optional timeframe for multi-TF
+            if "timeframe" in signal:
+                signal["timeframe"] = _normalize_timeframe(signal["timeframe"])
 
         elif kind == "crossover":
             fast = signal.get("fast") if isinstance(signal.get("fast"), dict) else {}
@@ -314,6 +361,36 @@ def _normalize_signals(signals: Any, timeframe: str) -> List[Dict[str, Any]]:
             else:
                 signal["every_n_bars"] = every_n_bars
             signal["action"] = _normalize_signal_action(signal.get("action"), fallback="buy")
+            if "gate" in signal and isinstance(signal["gate"], dict):
+                signal["gate"] = _normalize_gate(signal["gate"])
+
+        elif kind == "position_pnl":
+            if "pnl_pct_above" in signal:
+                v = _to_float(signal["pnl_pct_above"])
+                if v is not None:
+                    signal["pnl_pct_above"] = _pct_ratio(v) if abs(v) > 1 else v
+            if "pnl_pct_below" in signal:
+                v = _to_float(signal["pnl_pct_below"])
+                if v is not None:
+                    signal["pnl_pct_below"] = _pct_ratio(v) if abs(v) > 1 else v
+            signal["action"] = _normalize_signal_action(signal.get("action"), fallback="buy")
+            if "gate" in signal and isinstance(signal["gate"], dict):
+                signal["gate"] = _normalize_gate(signal["gate"])
+
+        elif kind == "ranking":
+            rank_by = signal.get("rank_by")
+            if not isinstance(rank_by, str) or not rank_by.strip():
+                signal["rank_by"] = "change_24h"
+            long_top_n = _to_int(signal.get("long_top_n"))
+            signal["long_top_n"] = long_top_n if long_top_n is not None and long_top_n >= 0 else 1
+            short_bottom_n = _to_int(signal.get("short_bottom_n"))
+            signal["short_bottom_n"] = short_bottom_n if short_bottom_n is not None and short_bottom_n >= 0 else 0
+            if "rebalance" in signal:
+                signal["rebalance"] = _to_bool(signal["rebalance"], False)
+            if "close_before_open" in signal:
+                signal["close_before_open"] = _to_bool(signal["close_before_open"], False)
+            if "gate" in signal and isinstance(signal["gate"], dict):
+                signal["gate"] = _normalize_gate(signal["gate"])
 
         normalized.append(signal)
 
@@ -395,7 +472,8 @@ def normalize_backtest_spec(
 
     sizing = spec.get("sizing") if isinstance(spec.get("sizing"), dict) else {}
     sizing_mode = sizing.get("mode")
-    if sizing_mode not in {"notional_usd", "margin_usd", "equity_pct", "base_units"}:
+    valid_sizing_modes = {"notional_usd", "margin_usd", "equity_pct", "base_units", "risk_based", "kelly", "signal_proportional"}
+    if sizing_mode not in valid_sizing_modes:
         sizing_mode = "notional_usd"
         assumptions.append("sizing.mode defaulted to notional_usd.")
     sizing_value = _to_float(sizing.get("value"))
@@ -405,7 +483,46 @@ def normalize_backtest_spec(
     if sizing_mode == "equity_pct" and sizing_value > 1:
         sizing_value = sizing_value / 100.0
         assumptions.append("sizing.value converted from percent to ratio for equity_pct.")
-    spec["sizing"] = {"mode": sizing_mode, "value": sizing_value}
+
+    normalized_sizing: Dict[str, Any] = {"mode": sizing_mode, "value": sizing_value}
+
+    # risk_based extras
+    if sizing_mode == "risk_based":
+        rpt = _to_float(sizing.get("risk_per_trade_usd"))
+        if rpt and rpt > 0:
+            normalized_sizing["risk_per_trade_usd"] = rpt
+        sl_atr = _to_float(sizing.get("sl_atr_multiple"))
+        if sl_atr and sl_atr > 0:
+            normalized_sizing["sl_atr_multiple"] = sl_atr
+
+    # kelly extras
+    if sizing_mode == "kelly":
+        kf = _to_float(sizing.get("kelly_fraction"))
+        if kf and 0 < kf <= 1:
+            normalized_sizing["kelly_fraction"] = kf
+        klt = _to_int(sizing.get("kelly_lookback_trades"))
+        if klt and klt > 0:
+            normalized_sizing["kelly_lookback_trades"] = klt
+        kmt = _to_int(sizing.get("kelly_min_trades"))
+        if kmt and kmt > 0:
+            normalized_sizing["kelly_min_trades"] = kmt
+        mbp = _to_float(sizing.get("max_balance_pct"))
+        if mbp and 0 < mbp <= 1:
+            normalized_sizing["max_balance_pct"] = mbp
+
+    # signal_proportional extras
+    if sizing_mode == "signal_proportional":
+        bn = _to_float(sizing.get("base_notional_usd"))
+        if bn and bn > 0:
+            normalized_sizing["base_notional_usd"] = bn
+        mn = _to_float(sizing.get("max_notional_usd"))
+        if mn and mn > 0:
+            normalized_sizing["max_notional_usd"] = mn
+        sf = sizing.get("signal_field")
+        if isinstance(sf, str) and sf.strip():
+            normalized_sizing["signal_field"] = sf.strip()
+
+    spec["sizing"] = normalized_sizing
 
     risk = spec.get("risk") if isinstance(spec.get("risk"), dict) else {}
     leverage = _to_float(risk.get("leverage"))
@@ -428,10 +545,19 @@ def normalize_backtest_spec(
         "allow_flip": _to_bool(risk.get("allow_flip"), True),
     }
 
-    for optional_key in ("daily_loss_limit_usd", "max_position_notional_usd"):
+    for optional_key in ("daily_loss_limit_usd", "max_position_notional_usd", "max_total_notional_usd", "max_total_margin_usd"):
         opt = _to_float(risk.get(optional_key))
         if opt is not None and opt > 0:
             normalized_risk[optional_key] = opt
+
+    # Maintenance margin rate
+    mmr = _to_float(risk.get("maintenance_margin_rate"))
+    if mmr is not None and 0 < mmr <= 1:
+        normalized_risk["maintenance_margin_rate"] = mmr
+
+    # Independent sub-positions (grid trading)
+    if "independent_sub_positions" in risk:
+        normalized_risk["independent_sub_positions"] = _to_bool(risk["independent_sub_positions"], False)
 
     spec["risk"] = normalized_risk
 
@@ -510,15 +636,76 @@ def normalize_backtest_spec(
         else:
             spec["seed"] = seed
 
+    # Pass through optional extended fields (validated by schema)
+    if "conditions" in spec and isinstance(spec["conditions"], list):
+        pass  # keep as-is; schema will validate
+    elif "conditions" in spec:
+        spec.pop("conditions", None)
+
+    if "hooks" in spec and isinstance(spec["hooks"], list):
+        pass  # keep as-is; schema will validate
+    elif "hooks" in spec:
+        spec.pop("hooks", None)
+
+    if "auxiliary_timeframes" in spec and isinstance(spec["auxiliary_timeframes"], list):
+        pass  # keep as-is; schema will validate
+    elif "auxiliary_timeframes" in spec:
+        spec.pop("auxiliary_timeframes", None)
+
     return spec, assumptions
 
 
 class BacktestSpecGenerator:
-    """Generates normalized + validated backtest strategy specs from natural language."""
+    """Generates normalized + validated backtest strategy specs from natural language.
+
+    Includes a validate-or-correct guardrail: if the LLM output fails schema
+    validation after normalization, the errors are sent back to the LLM for a
+    correction pass (up to MAX_CORRECTION_ATTEMPTS times).
+    """
 
     def __init__(self, ai_provider: AIProvider, validate: bool = True):
         self.ai_provider = ai_provider
         self.validate = validate
+
+    # ── internal: build correction prompt ──────────────────────────
+
+    @staticmethod
+    def _build_correction_prompt(
+        original_spec: Dict[str, Any],
+        errors: List[Dict[str, str]],
+    ) -> str:
+        error_lines = "\n".join(
+            f"  - {e['path']}: {e['message']}" for e in errors
+        )
+        return (
+            "The strategy_spec you generated failed schema validation.\n"
+            "Fix ONLY the fields listed below and return the corrected full JSON "
+            "envelope ({{ \"strategy_spec\": {{...}}, \"notes\": {{...}} }}).\n\n"
+            f"Validation errors:\n{error_lines}\n\n"
+            f"Original spec:\n{_json.dumps(original_spec, indent=2)}"
+        )
+
+    # ── internal: normalize + validate (returns errors or None) ────
+
+    def _normalize_and_validate(
+        self,
+        response: Dict[str, Any],
+        strategy_description: str,
+        now_ts: int,
+    ) -> Tuple[Dict[str, Any], List[str], Optional[List[Dict[str, str]]]]:
+        """Return (normalized_spec, assumptions, errors_or_None)."""
+        normalized_spec, assumptions = normalize_backtest_spec(
+            response, strategy_description, now_ts=now_ts
+        )
+        if not self.validate:
+            return normalized_spec, assumptions, None
+
+        valid, errors = validate_backtest_spec(normalized_spec)
+        if valid:
+            return normalized_spec, assumptions, None
+        return normalized_spec, assumptions, errors
+
+    # ── public entry point ─────────────────────────────────────────
 
     async def generate_backtest_spec(self, strategy_description: str) -> Dict[str, Any]:
         now_ts = _now_ms()
@@ -535,14 +722,46 @@ class BacktestSpecGenerator:
         if not isinstance(response, dict):
             raise ValueError("LLM response must be a JSON object")
 
-        normalized_spec, normalization_assumptions = normalize_backtest_spec(
-            response,
-            strategy_description,
-            now_ts=now_ts,
+        # ── validate-or-correct loop ─────────────────────────────
+        normalized_spec, normalization_assumptions, val_errors = (
+            self._normalize_and_validate(response, strategy_description, now_ts)
         )
-        if self.validate:
-            normalized_spec = assert_valid_backtest_spec(normalized_spec)
 
+        correction_attempts = 0
+        while val_errors and correction_attempts < MAX_CORRECTION_ATTEMPTS:
+            correction_attempts += 1
+            logger.warning(
+                "Backtest spec validation failed (%d error(s)), requesting correction (attempt %d/%d)",
+                len(val_errors), correction_attempts, MAX_CORRECTION_ATTEMPTS,
+            )
+
+            correction_prompt = self._build_correction_prompt(normalized_spec, val_errors)
+            try:
+                corrected_response = await self.ai_provider.generate_with_json(
+                    system_prompt=BACKTEST_SPEC_SYSTEM_PROMPT,
+                    user_prompt=correction_prompt,
+                )
+                if not isinstance(corrected_response, dict):
+                    break
+
+                response = corrected_response
+                normalized_spec, extra_assumptions, val_errors = (
+                    self._normalize_and_validate(corrected_response, strategy_description, now_ts)
+                )
+                normalization_assumptions.extend(extra_assumptions)
+                if not val_errors:
+                    normalization_assumptions.append(
+                        f"Spec was auto-corrected after {correction_attempts} correction pass(es)."
+                    )
+            except Exception as exc:
+                logger.error("Correction pass %d failed: %s", correction_attempts, exc)
+                break
+
+        # If validation is on and errors remain after all corrections, raise
+        if self.validate and val_errors:
+            normalized_spec = assert_valid_backtest_spec(normalized_spec)  # will raise
+
+        # ── assemble notes ───────────────────────────────────────
         notes = response.get("notes", {})
         if not isinstance(notes, dict):
             notes = {}

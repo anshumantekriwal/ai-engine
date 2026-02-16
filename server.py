@@ -22,6 +22,7 @@ from backtest_spec_generator import BacktestSpecGenerator
 from backtest_spec_schema import validate_backtest_spec
 from strategy_spec_generator import StrategySpecGenerator
 from strategy_spec_schema import validate_strategy_spec
+from backtest_v2_spec_generator import BacktestV2SpecGenerator
 
 from contextlib import asynccontextmanager
 
@@ -106,6 +107,10 @@ backtest_spec_generator = BacktestSpecGenerator(
     ai_provider=ai_provider,
     validate=VALIDATION_ENABLED
 )
+backtest_v2_spec_generator = BacktestV2SpecGenerator(
+    ai_provider=ai_provider,
+    validate=VALIDATION_ENABLED
+)
 
 
 # ============================================================================
@@ -167,6 +172,26 @@ class GenerateBacktestSpecRequest(BaseModel):
                 "strategy_description": "Trade BTC using EMA 9/21 crossover on 5m candles with 5x leverage and 4% stop loss."
             }
         }
+
+
+class GenerateBacktestV2SpecRequest(BaseModel):
+    """Request for backtest v2 SpecAgent strategy_spec generation"""
+    strategy_description: str = Field(..., description="Trading strategy description")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "strategy_description": "Buy BTC when RSI(14) drops below 30 on 1h candles, sell when RSI rises above 70. Use 0.01 BTC per trade."
+            }
+        }
+
+
+class GenerateBacktestV2SpecResponse(BaseModel):
+    """Response from backtest v2 SpecAgent strategy_spec generation"""
+    success: bool
+    strategy_spec: Optional[Dict[str, Any]] = None
+    notes: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 class CreateAgentRequest(BaseModel):
@@ -414,6 +439,38 @@ async def generate_backtest_strategy_spec(request: GenerateBacktestSpecRequest):
         print(f"❌ backtest strategy_spec generation failed: {str(e)}")
         print(f"{'='*60}\n")
         return GenerateBacktestSpecResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+@app.post("/generate-backtest-spec-v2", response_model=GenerateBacktestV2SpecResponse)
+async def generate_backtest_v2_strategy_spec(request: GenerateBacktestV2SpecRequest):
+    """
+    Generate a SpecAgent-format strategy_spec for the backtest-engine v2.
+    Uses the Hyperliquid SpecAgent spec format (triggers + workflows + expressions).
+    """
+    try:
+        print(f"\n{'='*60}")
+        print("📥 Generating backtest v2 SpecAgent strategy_spec")
+        print(f"{'='*60}")
+
+        result = await backtest_v2_spec_generator.generate_backtest_v2_spec(
+            strategy_description=request.strategy_description
+        )
+
+        print("✅ backtest v2 strategy_spec generated")
+        print(f"{'='*60}\n")
+
+        return GenerateBacktestV2SpecResponse(
+            success=True,
+            strategy_spec=result["strategy_spec"],
+            notes=result.get("notes", {}),
+        )
+    except Exception as e:
+        print(f"❌ backtest v2 strategy_spec generation failed: {str(e)}")
+        print(f"{'='*60}\n")
+        return GenerateBacktestV2SpecResponse(
             success=False,
             error=str(e)
         )

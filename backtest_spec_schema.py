@@ -1,5 +1,9 @@
 """
 Validation utilities for the backtest-tool strategy_spec contract.
+Covers v1 schema including all Tier A/B/C features:
+  - 9 indicators, 6 signal kinds, signal gates
+  - Compound conditions, custom hooks
+  - Dynamic sizing, portfolio-level risk, liquidation simulation
 """
 
 from __future__ import annotations
@@ -23,15 +27,48 @@ TIMEFRAMES = {
     "1w",
     "1M",
 }
-SIGNAL_KINDS = {"threshold", "crossover", "price", "scheduled"}
-INDICATORS = {"RSI", "EMA", "SMA", "MACD", "BollingerBands"}
-CHECK_FIELDS = {"value", "MACD", "signal", "histogram", "upper", "middle", "lower"}
+SIGNAL_KINDS = {"threshold", "crossover", "price", "scheduled", "position_pnl", "ranking"}
+INDICATORS = {"RSI", "EMA", "SMA", "MACD", "BollingerBands", "ATR", "ADX", "VWAP", "Stochastic"}
+CHECK_FIELDS = {
+    "value",
+    "MACD",
+    "signal",
+    "histogram",
+    "upper",
+    "middle",
+    "lower",
+    "atr",
+    "adx",
+    "plusDI",
+    "minusDI",
+    "vwap",
+    "k",
+    "d",
+}
 THRESHOLD_OPERATORS = {"lt", "lte", "gt", "gte"}
 ACTIONS = {"buy", "sell"}
-SIZING_MODES = {"notional_usd", "margin_usd", "equity_pct", "base_units"}
+SIZING_MODES = {
+    "notional_usd",
+    "margin_usd",
+    "equity_pct",
+    "base_units",
+    "risk_based",
+    "kelly",
+    "signal_proportional",
+}
 ENTRY_ORDER_TYPES = {"market", "limit", "Ioc", "Gtc", "Alo"}
 EXIT_ORDER_TYPES = {"market", "limit"}
 TRIGGER_TYPES = {"mark", "last", "oracle"}
+
+# Condition clause types
+CONDITION_CLAUSE_TYPES = {"signal_active", "indicator_compare", "price_compare", "position_state", "volume_compare"}
+CONDITION_OPERATORS = {"and", "or"}
+
+# Hook trigger types
+HOOK_TRIGGERS = {"per_bar", "on_entry_signal", "on_exit", "on_sizing"}
+
+# Ranking rank_by options
+RANKING_RANK_BY = {"change_24h", "predicted_funding"}
 
 
 def _is_dict(value: Any) -> bool:
@@ -70,6 +107,40 @@ def _require_nonnegative_number(
         _add_error(errors, path, "must be a non-negative number")
 
 
+# ─── Signal Gate Validation ─────────────────────────────────────────
+
+
+def _validate_signal_gate(gate: Any, path: str, errors: List[Dict[str, str]]) -> None:
+    if gate is None:
+        return
+    if not _is_dict(gate):
+        _add_error(errors, path, "gate must be an object")
+        return
+
+    if "cooldown_bars" in gate:
+        v = gate["cooldown_bars"]
+        if not isinstance(v, int) or v <= 0:
+            _add_error(errors, f"{path}.cooldown_bars", "must be a positive integer")
+
+    if "max_total_fires" in gate:
+        v = gate["max_total_fires"]
+        if not isinstance(v, int) or v <= 0:
+            _add_error(errors, f"{path}.max_total_fires", "must be a positive integer")
+
+    if "requires_no_position" in gate and not isinstance(gate["requires_no_position"], bool):
+        _add_error(errors, f"{path}.requires_no_position", "must be a boolean")
+
+    if "requires_position" in gate and not isinstance(gate["requires_position"], bool):
+        _add_error(errors, f"{path}.requires_position", "must be a boolean")
+
+    # Mutually exclusive
+    if gate.get("requires_no_position") is True and gate.get("requires_position") is True:
+        _add_error(errors, path, "requires_no_position and requires_position cannot both be true")
+
+
+# ─── Threshold Signal ────────────────────────────────────────────────
+
+
 def _validate_threshold_signal(signal: Dict[str, Any], idx: int, errors: List[Dict[str, str]]) -> None:
     path = f"signals[{idx}]"
 
@@ -90,6 +161,7 @@ def _validate_threshold_signal(signal: Dict[str, Any], idx: int, errors: List[Di
     if signal.get("action") not in ACTIONS:
         _add_error(errors, f"{path}.action", f"must be one of: {sorted(ACTIONS)}")
 
+    # Indicator-specific parameter validation
     if indicator == "MACD":
         for key in ("fastPeriod", "slowPeriod", "signalPeriod"):
             value = signal.get(key)
@@ -106,9 +178,32 @@ def _validate_threshold_signal(signal: Dict[str, Any], idx: int, errors: List[Di
             _add_error(errors, f"{path}.stdDev", "must be a positive number for BollingerBands signals")
         return
 
-    period = signal.get("period")
-    if not isinstance(period, int) or period <= 0:
-        _add_error(errors, f"{path}.period", "must be a positive integer")
+    if indicator == "Stochastic":
+        period = signal.get("period")
+        if not isinstance(period, int) or period <= 0:
+            _add_error(errors, f"{path}.period", "must be a positive integer for Stochastic signals")
+        signal_period = signal.get("signalPeriod")
+        if signal_period is not None and (not isinstance(signal_period, int) or signal_period <= 0):
+            _add_error(errors, f"{path}.signalPeriod", "must be a positive integer for Stochastic signals")
+        return
+
+    # RSI, EMA, SMA, ATR, ADX, VWAP all require period
+    if indicator in ("RSI", "EMA", "SMA", "ATR", "ADX", "VWAP"):
+        period = signal.get("period")
+        if not isinstance(period, int) or period <= 0:
+            _add_error(errors, f"{path}.period", "must be a positive integer")
+
+    # Optional timeframe for multi-TF
+    if "timeframe" in signal:
+        tf = signal["timeframe"]
+        if tf not in TIMEFRAMES:
+            _add_error(errors, f"{path}.timeframe", f"must be one of: {sorted(TIMEFRAMES)}")
+
+    # Gate
+    _validate_signal_gate(signal.get("gate"), f"{path}.gate", errors)
+
+
+# ─── Crossover Signal ────────────────────────────────────────────────
 
 
 def _validate_crossover_signal(signal: Dict[str, Any], idx: int, errors: List[Dict[str, str]]) -> None:
@@ -134,6 +229,9 @@ def _validate_crossover_signal(signal: Dict[str, Any], idx: int, errors: List[Di
         _add_error(errors, f"{path}.action_on_bearish", f"must be one of: {sorted(ACTIONS)}")
 
 
+# ─── Price Signal ─────────────────────────────────────────────────────
+
+
 def _validate_price_signal(signal: Dict[str, Any], idx: int, errors: List[Dict[str, str]]) -> None:
     path = f"signals[{idx}]"
     condition = signal.get("condition")
@@ -150,6 +248,9 @@ def _validate_price_signal(signal: Dict[str, Any], idx: int, errors: List[Dict[s
         _add_error(errors, f"{path}.action", f"must be one of: {sorted(ACTIONS)}")
 
 
+# ─── Scheduled Signal ─────────────────────────────────────────────────
+
+
 def _validate_scheduled_signal(signal: Dict[str, Any], idx: int, errors: List[Dict[str, str]]) -> None:
     path = f"signals[{idx}]"
     every_n_bars = signal.get("every_n_bars")
@@ -157,6 +258,64 @@ def _validate_scheduled_signal(signal: Dict[str, Any], idx: int, errors: List[Di
         _add_error(errors, f"{path}.every_n_bars", "must be a positive integer")
     if signal.get("action") not in ACTIONS:
         _add_error(errors, f"{path}.action", f"must be one of: {sorted(ACTIONS)}")
+    _validate_signal_gate(signal.get("gate"), f"{path}.gate", errors)
+
+
+# ─── Position PnL Signal ──────────────────────────────────────────────
+
+
+def _validate_position_pnl_signal(signal: Dict[str, Any], idx: int, errors: List[Dict[str, str]]) -> None:
+    path = f"signals[{idx}]"
+
+    has_above = "pnl_pct_above" in signal
+    has_below = "pnl_pct_below" in signal
+
+    if not has_above and not has_below:
+        _add_error(errors, path, "must include at least one of pnl_pct_above or pnl_pct_below")
+
+    if has_above and not _is_number(signal["pnl_pct_above"]):
+        _add_error(errors, f"{path}.pnl_pct_above", "must be a number")
+
+    if has_below and not _is_number(signal["pnl_pct_below"]):
+        _add_error(errors, f"{path}.pnl_pct_below", "must be a number")
+
+    if signal.get("action") not in ACTIONS:
+        _add_error(errors, f"{path}.action", f"must be one of: {sorted(ACTIONS)}")
+
+    _validate_signal_gate(signal.get("gate"), f"{path}.gate", errors)
+
+
+# ─── Ranking Signal ───────────────────────────────────────────────────
+
+
+def _validate_ranking_signal(signal: Dict[str, Any], idx: int, errors: List[Dict[str, str]]) -> None:
+    path = f"signals[{idx}]"
+
+    rank_by = signal.get("rank_by")
+    if not isinstance(rank_by, str) or not rank_by.strip():
+        _add_error(errors, f"{path}.rank_by", "must be a non-empty string")
+
+    long_top_n = signal.get("long_top_n")
+    if not isinstance(long_top_n, int) or long_top_n < 0:
+        _add_error(errors, f"{path}.long_top_n", "must be a non-negative integer")
+
+    short_bottom_n = signal.get("short_bottom_n")
+    if not isinstance(short_bottom_n, int) or short_bottom_n < 0:
+        _add_error(errors, f"{path}.short_bottom_n", "must be a non-negative integer")
+
+    if isinstance(long_top_n, int) and isinstance(short_bottom_n, int) and long_top_n == 0 and short_bottom_n == 0:
+        _add_error(errors, path, "at least one of long_top_n or short_bottom_n must be positive")
+
+    if "rebalance" in signal and not isinstance(signal["rebalance"], bool):
+        _add_error(errors, f"{path}.rebalance", "must be a boolean")
+
+    if "close_before_open" in signal and not isinstance(signal["close_before_open"], bool):
+        _add_error(errors, f"{path}.close_before_open", "must be a boolean")
+
+    _validate_signal_gate(signal.get("gate"), f"{path}.gate", errors)
+
+
+# ─── Signals (all kinds) ──────────────────────────────────────────────
 
 
 def _validate_signals(signals: Any, errors: List[Dict[str, str]]) -> None:
@@ -192,6 +351,13 @@ def _validate_signals(signals: Any, errors: List[Dict[str, str]]) -> None:
             _validate_price_signal(signal, idx, errors)
         elif kind == "scheduled":
             _validate_scheduled_signal(signal, idx, errors)
+        elif kind == "position_pnl":
+            _validate_position_pnl_signal(signal, idx, errors)
+        elif kind == "ranking":
+            _validate_ranking_signal(signal, idx, errors)
+
+
+# ─── Exits ─────────────────────────────────────────────────────────────
 
 
 def _validate_exits(exits: Any, errors: List[Dict[str, str]]) -> None:
@@ -247,6 +413,9 @@ def _validate_exits(exits: Any, errors: List[Dict[str, str]]) -> None:
         )
 
 
+# ─── Execution ─────────────────────────────────────────────────────────
+
+
 def _validate_execution(execution: Any, errors: List[Dict[str, str]]) -> None:
     if not _is_dict(execution):
         _add_error(errors, "execution", "must be an object")
@@ -277,6 +446,276 @@ def _validate_execution(execution: Any, errors: List[Dict[str, str]]) -> None:
 
     if not isinstance(execution.get("reduce_only_on_exits"), bool):
         _add_error(errors, "execution.reduce_only_on_exits", "must be a boolean")
+
+
+# ─── Sizing (extended) ────────────────────────────────────────────────
+
+
+def _validate_sizing(sizing: Any, errors: List[Dict[str, str]]) -> None:
+    if not _is_dict(sizing):
+        _add_error(errors, "sizing", "must be an object")
+        return
+
+    mode = sizing.get("mode")
+    if mode not in SIZING_MODES:
+        _add_error(errors, "sizing.mode", f"must be one of: {sorted(SIZING_MODES)}")
+
+    _require_positive_number(sizing, "value", errors, "sizing.")
+
+    if mode == "equity_pct" and _is_number(sizing.get("value")) and float(sizing["value"]) > 1:
+        _add_error(errors, "sizing.value", "must be <= 1.0 when mode is equity_pct")
+
+    # risk_based mode fields
+    if mode == "risk_based":
+        if "risk_per_trade_usd" in sizing:
+            _require_positive_number(sizing, "risk_per_trade_usd", errors, "sizing.")
+        else:
+            _add_error(errors, "sizing.risk_per_trade_usd", "required for risk_based mode")
+        if "sl_atr_multiple" in sizing:
+            _require_positive_number(sizing, "sl_atr_multiple", errors, "sizing.")
+        else:
+            _add_error(errors, "sizing.sl_atr_multiple", "required for risk_based mode")
+
+    # kelly mode fields
+    if mode == "kelly":
+        if "kelly_fraction" in sizing:
+            v = sizing["kelly_fraction"]
+            if not _is_number(v) or float(v) <= 0 or float(v) > 1:
+                _add_error(errors, "sizing.kelly_fraction", "must be a number in (0, 1]")
+        else:
+            _add_error(errors, "sizing.kelly_fraction", "required for kelly mode")
+
+        if "kelly_lookback_trades" in sizing:
+            v = sizing["kelly_lookback_trades"]
+            if not isinstance(v, int) or v <= 0:
+                _add_error(errors, "sizing.kelly_lookback_trades", "must be a positive integer")
+
+        if "kelly_min_trades" in sizing:
+            v = sizing["kelly_min_trades"]
+            if not isinstance(v, int) or v <= 0:
+                _add_error(errors, "sizing.kelly_min_trades", "must be a positive integer")
+
+        if "max_balance_pct" in sizing:
+            v = sizing["max_balance_pct"]
+            if not _is_number(v) or float(v) <= 0 or float(v) > 1:
+                _add_error(errors, "sizing.max_balance_pct", "must be a number in (0, 1]")
+
+    # signal_proportional mode fields
+    if mode == "signal_proportional":
+        if "base_notional_usd" in sizing:
+            _require_positive_number(sizing, "base_notional_usd", errors, "sizing.")
+        if "max_notional_usd" in sizing:
+            _require_positive_number(sizing, "max_notional_usd", errors, "sizing.")
+
+
+# ─── Risk (extended) ──────────────────────────────────────────────────
+
+
+def _validate_risk(risk: Any, errors: List[Dict[str, str]]) -> None:
+    if not _is_dict(risk):
+        _add_error(errors, "risk", "must be an object")
+        return
+
+    _require_positive_number(risk, "leverage", errors, "risk.")
+
+    max_positions = risk.get("max_positions")
+    if not isinstance(max_positions, int) or max_positions <= 0:
+        _add_error(errors, "risk.max_positions", "must be a positive integer")
+
+    _require_positive_number(risk, "min_notional_usd", errors, "risk.")
+
+    if "daily_loss_limit_usd" in risk:
+        _require_positive_number(risk, "daily_loss_limit_usd", errors, "risk.")
+
+    if "max_position_notional_usd" in risk:
+        _require_positive_number(risk, "max_position_notional_usd", errors, "risk.")
+
+    if "allow_position_add" in risk and not isinstance(risk.get("allow_position_add"), bool):
+        _add_error(errors, "risk.allow_position_add", "must be a boolean")
+
+    if "allow_flip" in risk and not isinstance(risk.get("allow_flip"), bool):
+        _add_error(errors, "risk.allow_flip", "must be a boolean")
+
+    # Portfolio-level risk fields
+    if "max_total_notional_usd" in risk:
+        _require_positive_number(risk, "max_total_notional_usd", errors, "risk.")
+
+    if "max_total_margin_usd" in risk:
+        _require_positive_number(risk, "max_total_margin_usd", errors, "risk.")
+
+    if "maintenance_margin_rate" in risk:
+        v = risk["maintenance_margin_rate"]
+        if not _is_number(v) or float(v) <= 0 or float(v) > 1:
+            _add_error(errors, "risk.maintenance_margin_rate", "must be a number in (0, 1]")
+
+    if "independent_sub_positions" in risk and not isinstance(risk["independent_sub_positions"], bool):
+        _add_error(errors, "risk.independent_sub_positions", "must be a boolean")
+
+
+# ─── Conditions ────────────────────────────────────────────────────────
+
+
+def _validate_condition_clause(clause: Any, path: str, errors: List[Dict[str, str]]) -> None:
+    if not _is_dict(clause):
+        _add_error(errors, path, "must be an object")
+        return
+
+    clause_type = clause.get("type")
+    if clause_type not in CONDITION_CLAUSE_TYPES:
+        _add_error(errors, f"{path}.type", f"must be one of: {sorted(CONDITION_CLAUSE_TYPES)}")
+        return
+
+    if "negate" in clause and not isinstance(clause["negate"], bool):
+        _add_error(errors, f"{path}.negate", "must be a boolean")
+
+    if clause_type == "signal_active":
+        signal_id = clause.get("signal_id")
+        if not isinstance(signal_id, str) or not signal_id.strip():
+            _add_error(errors, f"{path}.signal_id", "must be a non-empty string")
+
+    elif clause_type == "indicator_compare":
+        indicator = clause.get("indicator")
+        if not isinstance(indicator, str) or not indicator.strip():
+            _add_error(errors, f"{path}.indicator", "must be a non-empty string (e.g. 'RSI:14' or 'EMA:50:4h')")
+        if clause.get("operator") not in THRESHOLD_OPERATORS:
+            _add_error(errors, f"{path}.operator", f"must be one of: {sorted(THRESHOLD_OPERATORS)}")
+
+    elif clause_type == "price_compare":
+        if clause.get("operator") not in THRESHOLD_OPERATORS:
+            _add_error(errors, f"{path}.operator", f"must be one of: {sorted(THRESHOLD_OPERATORS)}")
+
+    elif clause_type == "position_state":
+        if "has_position" in clause and not isinstance(clause["has_position"], bool):
+            _add_error(errors, f"{path}.has_position", "must be a boolean")
+        if "position_side" in clause and clause["position_side"] not in {"long", "short"}:
+            _add_error(errors, f"{path}.position_side", "must be 'long' or 'short'")
+        if "position_pnl_pct_above" in clause and not _is_number(clause["position_pnl_pct_above"]):
+            _add_error(errors, f"{path}.position_pnl_pct_above", "must be a number")
+        if "position_pnl_pct_below" in clause and not _is_number(clause["position_pnl_pct_below"]):
+            _add_error(errors, f"{path}.position_pnl_pct_below", "must be a number")
+
+    elif clause_type == "volume_compare":
+        if "volume_ratio_above" in clause:
+            v = clause["volume_ratio_above"]
+            if not _is_number(v) or float(v) <= 0:
+                _add_error(errors, f"{path}.volume_ratio_above", "must be a positive number")
+        if "volume_lookback" in clause:
+            v = clause["volume_lookback"]
+            if not isinstance(v, int) or v <= 0:
+                _add_error(errors, f"{path}.volume_lookback", "must be a positive integer")
+
+
+def _validate_conditions(conditions: Any, errors: List[Dict[str, str]]) -> None:
+    if conditions is None:
+        return
+    if not isinstance(conditions, list):
+        _add_error(errors, "conditions", "must be a list")
+        return
+
+    seen_ids = set()
+    for idx, cond in enumerate(conditions):
+        path = f"conditions[{idx}]"
+        if not _is_dict(cond):
+            _add_error(errors, path, "must be an object")
+            continue
+
+        cond_id = cond.get("id")
+        if not isinstance(cond_id, str) or not cond_id.strip():
+            _add_error(errors, f"{path}.id", "must be a non-empty string")
+        elif cond_id in seen_ids:
+            _add_error(errors, f"{path}.id", f"duplicate condition id: {cond_id}")
+        else:
+            seen_ids.add(cond_id)
+
+        operator = cond.get("operator")
+        if operator not in CONDITION_OPERATORS:
+            _add_error(errors, f"{path}.operator", f"must be one of: {sorted(CONDITION_OPERATORS)}")
+
+        clauses = cond.get("clauses")
+        if not isinstance(clauses, list) or len(clauses) == 0:
+            _add_error(errors, f"{path}.clauses", "must be a non-empty list")
+        else:
+            for cidx, clause in enumerate(clauses):
+                _validate_condition_clause(clause, f"{path}.clauses[{cidx}]", errors)
+
+        if cond.get("action") not in ACTIONS:
+            _add_error(errors, f"{path}.action", f"must be one of: {sorted(ACTIONS)}")
+
+        if "priority" in cond:
+            v = cond["priority"]
+            if not isinstance(v, int):
+                _add_error(errors, f"{path}.priority", "must be an integer")
+
+
+# ─── Hooks ─────────────────────────────────────────────────────────────
+
+
+def _validate_hooks(hooks: Any, errors: List[Dict[str, str]]) -> None:
+    if hooks is None:
+        return
+    if not isinstance(hooks, list):
+        _add_error(errors, "hooks", "must be a list")
+        return
+
+    seen_ids = set()
+    for idx, hook in enumerate(hooks):
+        path = f"hooks[{idx}]"
+        if not _is_dict(hook):
+            _add_error(errors, path, "must be an object")
+            continue
+
+        hook_id = hook.get("id")
+        if not isinstance(hook_id, str) or not hook_id.strip():
+            _add_error(errors, f"{path}.id", "must be a non-empty string")
+        elif hook_id in seen_ids:
+            _add_error(errors, f"{path}.id", f"duplicate hook id: {hook_id}")
+        else:
+            seen_ids.add(hook_id)
+
+        trigger = hook.get("trigger")
+        if trigger not in HOOK_TRIGGERS:
+            _add_error(errors, f"{path}.trigger", f"must be one of: {sorted(HOOK_TRIGGERS)}")
+
+        code = hook.get("code")
+        if not isinstance(code, str) or not code.strip():
+            _add_error(errors, f"{path}.code", "must be a non-empty string")
+
+        if "timeout_ms" in hook:
+            v = hook["timeout_ms"]
+            if not isinstance(v, int) or v <= 0:
+                _add_error(errors, f"{path}.timeout_ms", "must be a positive integer")
+
+
+# ─── Auxiliary Timeframes ──────────────────────────────────────────────
+
+
+def _validate_auxiliary_timeframes(aux_tfs: Any, errors: List[Dict[str, str]]) -> None:
+    if aux_tfs is None:
+        return
+    if not isinstance(aux_tfs, list):
+        _add_error(errors, "auxiliary_timeframes", "must be a list")
+        return
+
+    for idx, entry in enumerate(aux_tfs):
+        path = f"auxiliary_timeframes[{idx}]"
+        if not _is_dict(entry):
+            _add_error(errors, path, "must be an object")
+            continue
+
+        tf = entry.get("timeframe")
+        if tf not in TIMEFRAMES:
+            _add_error(errors, f"{path}.timeframe", f"must be one of: {sorted(TIMEFRAMES)}")
+
+        markets = entry.get("markets")
+        if not isinstance(markets, list) or len(markets) == 0:
+            _add_error(errors, f"{path}.markets", "must be a non-empty list")
+        else:
+            for midx, m in enumerate(markets):
+                if not isinstance(m, str) or not m.strip():
+                    _add_error(errors, f"{path}.markets[{midx}]", "must be a non-empty string")
+
+
+# ─── Top-level Validator ──────────────────────────────────────────────
 
 
 def validate_backtest_spec(spec: Any) -> Tuple[bool, List[Dict[str, str]]]:
@@ -318,37 +757,15 @@ def validate_backtest_spec(spec: Any) -> Tuple[bool, List[Dict[str, str]]]:
         _add_error(errors, "end_ts", "must be greater than start_ts")
 
     _validate_signals(spec.get("signals"), errors)
-
-    sizing = spec.get("sizing")
-    if not _is_dict(sizing):
-        _add_error(errors, "sizing", "must be an object")
-    else:
-        if sizing.get("mode") not in SIZING_MODES:
-            _add_error(errors, "sizing.mode", f"must be one of: {sorted(SIZING_MODES)}")
-        _require_positive_number(sizing, "value", errors, "sizing.")
-        if sizing.get("mode") == "equity_pct" and _is_number(sizing.get("value")) and float(sizing["value"]) > 1:
-            _add_error(errors, "sizing.value", "must be <= 1.0 when mode is equity_pct")
-
-    risk = spec.get("risk")
-    if not _is_dict(risk):
-        _add_error(errors, "risk", "must be an object")
-    else:
-        _require_positive_number(risk, "leverage", errors, "risk.")
-        max_positions = risk.get("max_positions")
-        if not isinstance(max_positions, int) or max_positions <= 0:
-            _add_error(errors, "risk.max_positions", "must be a positive integer")
-        _require_positive_number(risk, "min_notional_usd", errors, "risk.")
-        if "daily_loss_limit_usd" in risk:
-            _require_positive_number(risk, "daily_loss_limit_usd", errors, "risk.")
-        if "max_position_notional_usd" in risk:
-            _require_positive_number(risk, "max_position_notional_usd", errors, "risk.")
-        if "allow_position_add" in risk and not isinstance(risk.get("allow_position_add"), bool):
-            _add_error(errors, "risk.allow_position_add", "must be a boolean")
-        if "allow_flip" in risk and not isinstance(risk.get("allow_flip"), bool):
-            _add_error(errors, "risk.allow_flip", "must be a boolean")
-
+    _validate_sizing(spec.get("sizing"), errors)
+    _validate_risk(spec.get("risk"), errors)
     _validate_exits(spec.get("exits"), errors)
     _validate_execution(spec.get("execution"), errors)
+
+    # Optional extended fields
+    _validate_conditions(spec.get("conditions"), errors)
+    _validate_hooks(spec.get("hooks"), errors)
+    _validate_auxiliary_timeframes(spec.get("auxiliary_timeframes"), errors)
 
     if "initial_capital_usd" in spec:
         if not _is_number(spec.get("initial_capital_usd")) or float(spec["initial_capital_usd"]) <= 0:

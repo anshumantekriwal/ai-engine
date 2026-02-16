@@ -10,7 +10,13 @@ SUPPORTED_VERSION = "1.0"
 SUPPORTED_MODES = {"spec", "hybrid"}
 TRIGGER_TYPES = {"price", "technical", "scheduled", "event"}
 EVENT_TYPES = {"liquidation", "largeTrade", "userFill", "l2Book"}
-TECHNICAL_INDICATORS = {"RSI", "EMA", "SMA", "MACD", "BollingerBands"}
+TECHNICAL_INDICATORS = {
+    "RSI", "EMA", "SMA", "WMA", "MACD", "BollingerBands",
+    "EMA_CROSSOVER", "SMA_CROSSOVER",
+    "ATR", "Stochastic", "StochasticRSI", "WilliamsR",
+    "ADX", "CCI", "ROC", "OBV", "TRIX", "MFI", "VWAP",
+    "PSAR", "KeltnerChannels",
+}
 ACTION_TYPES = {
     "set",
     "if",
@@ -102,8 +108,9 @@ def _validate_trigger(trigger: Dict[str, Any], idx: int, errors: List[Dict[str, 
             _add_error(errors, f"{path}.condition", "must be an object")
         else:
             condition = trigger["condition"]
-            if not any(k in condition for k in ("above", "below", "crosses")):
-                _add_error(errors, f"{path}.condition", "must include above/below/crosses")
+            valid_price_keys = ("above", "below", "crosses", "crosses_above", "crosses_below")
+            if not any(k in condition for k in valid_price_keys):
+                _add_error(errors, f"{path}.condition", f"must include one of: {', '.join(valid_price_keys)}")
 
     if trigger_type == "technical":
         if not isinstance(trigger.get("coin"), str) or not trigger["coin"].strip():
