@@ -18,12 +18,14 @@ class PositionTracker {
    * @param {string} agentId
    * @param {Object} [options]
    * @param {Function} [options.onSlTpFill] - Callback when a SL/TP fill is detected.
-   *   Receives { coin, side, size, price, fee, orderId, orderType, cloid, triggerType }.
+   *   Receives { coin, side, size, price, fee, orderId, orderType, cloid, triggerType, closedPosition }.
+   * @param {Function} [options.onLiquidation] - Callback when a liquidation is detected.
+   *   Receives { coin, side, size, price, fee, orderId, markPrice, closedPnl, closedPosition }.
    * @param {number} [options.defaultTakerFeeRate=0.00045] - Default taker fee rate
    *   used to estimate exit fees for externally closed positions and opposite-side
    *   auto-closes where the actual fee is unknown.
    */
-  constructor(agentId, { onSlTpFill, defaultTakerFeeRate = 0.00045 } = {}) {
+  constructor(agentId, { onSlTpFill, onLiquidation, defaultTakerFeeRate = 0.00045 } = {}) {
     this.agentId = agentId;
     this.positionsDir = path.join(__dirname, 'positions');
     
@@ -32,6 +34,8 @@ class PositionTracker {
 
     // SL/TP fill detection
     this.onSlTpFill = onSlTpFill || null;
+    // Liquidation detection
+    this.onLiquidation = onLiquidation || null;
     this.pendingSlTp = {};          // { [orderId]: { coin, cloid, orderType, size, triggerPrice, side } }
     this.pendingSlTpByCloid = {};   // { [cloid]: orderId } — reverse index
     
@@ -709,6 +713,82 @@ class PositionTracker {
   }
 
   /**
+   * Handle a liquidation fill event for this agent's position.
+   * Called from BaseAgent when a userEvents fill includes a `liquidation` object
+   * where the `liquidatedUser` matches the agent's address.
+   * 
+   * @param {Object} fill - The fill event from WS userEvents
+   * @param {string} fill.coin - Coin symbol
+   * @param {string} fill.px - Fill price
+   * @param {string} fill.sz - Fill size
+   * @param {string} fill.side - 'B' (buy) or 'A' (sell)
+   * @param {string} fill.oid - Order ID
+   * @param {string} [fill.fee] - Fee amount
+   * @param {string} [fill.closedPnl] - Realized PnL from exchange
+   * @param {Object} fill.liquidation - Liquidation details
+   * @param {string} fill.liquidation.markPx - Mark price at liquidation
+   * @returns {boolean} Whether we tracked this liquidation
+   */
+  handleLiquidationFill(fill) {
+    if (!fill || !fill.coin) return false;
+
+    const coin = fill.coin;
+    const position = this.openPositions[coin];
+    if (!position) {
+      console.warn(`⚠️  PositionTracker: liquidation fill for ${coin} but no tracked position`);
+      return false;
+    }
+
+    const fillPrice = parseFloat(fill.px);
+    const fillSize = parseFloat(fill.sz);
+    const fillSide = fill.side === 'B' ? 'buy' : 'sell';
+    const fee = fill.fee ? parseFloat(fill.fee) : 0;
+    const oid = String(fill.oid);
+    const markPrice = fill.liquidation?.markPx ? parseFloat(fill.liquidation.markPx) : fillPrice;
+    const closedPnl = fill.closedPnl ? parseFloat(fill.closedPnl) : null;
+
+    console.log(`💀 PositionTracker: LIQUIDATION detected — ${coin} | ${fillSize} @ $${fillPrice.toFixed(2)} (mark: $${markPrice.toFixed(2)})`);
+
+    // Close the position in local tracker
+    const closedPosition = this.closePosition(
+      coin,
+      fillSide,
+      fillSize,
+      fillPrice,
+      'liquidation',
+      oid,
+      fee,
+      fee > 0 && fillSize * fillPrice > 0
+        ? fee / (fillSize * fillPrice)
+        : this.defaultTakerFeeRate
+    );
+
+    // Also clean up any pending SL/TP orders for this coin (they're now irrelevant)
+    this.removeSlTpOrders(coin);
+
+    // Fire callback so BaseAgent can log to Supabase and notify the user
+    if (this.onLiquidation) {
+      try {
+        this.onLiquidation({
+          coin,
+          side: fillSide,
+          size: fillSize,
+          price: fillPrice,
+          fee,
+          orderId: oid,
+          markPrice,
+          closedPnl,
+          closedPosition
+        });
+      } catch (err) {
+        console.error('⚠️  PositionTracker: onLiquidation callback error:', err.message);
+      }
+    }
+
+    return true;
+  }
+
+  /**
    * Check pending SL/TP orders against recent fills (REST polling fallback).
    * Called from reconcile() to catch fills that the WebSocket may have missed.
    *
@@ -774,6 +854,31 @@ class PositionTracker {
         const reason = !exchangePos 
           ? 'not found on exchange' 
           : 'exchange position flipped direction';
+
+        // Check if this was a liquidation by scanning recent fills
+        if (recentFills) {
+          const liqFill = recentFills.find(f => 
+            f.coin === coin && f.liquidation && f.liquidation.liquidatedUser
+          );
+          if (liqFill) {
+            console.warn(`💀 PositionTracker: ${coin} position was LIQUIDATED (detected via reconcile fallback)`);
+            const handled = this.handleLiquidationFill({
+              coin: liqFill.coin,
+              px: String(liqFill.px),
+              sz: String(liqFill.sz),
+              side: liqFill.side === 'Buy' ? 'B' : 'A',
+              oid: String(liqFill.oid),
+              fee: liqFill.fee ? String(liqFill.fee) : '0',
+              closedPnl: liqFill.closedPnl ? String(liqFill.closedPnl) : undefined,
+              liquidation: liqFill.liquidation
+            });
+            if (handled) {
+              removed++;
+              continue; // Skip the generic external close path
+            }
+          }
+        }
+
         console.warn(`⚠️  PositionTracker: removing stale position for ${coin} (${reason})`);
         
         // Use current mid price as exit estimate; fall back to 0 (unknown)

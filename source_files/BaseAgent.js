@@ -133,6 +133,7 @@ class BaseAgent {
     // for externally closed positions and opposite-side auto-closes.
     this.positionTracker = new PositionTracker(this.agentId, {
       onSlTpFill: (fillData) => this._handleSlTpFill(fillData),
+      onLiquidation: (fillData) => this._handleLiquidation(fillData),
       defaultTakerFeeRate: this.orderExecutor.takerFeeRate
     });
     
@@ -150,6 +151,8 @@ class BaseAgent {
     this.currentState = 'initializing';
     this.isRunning = false;
     this.isPaused = false;
+    this._shutdownInProgress = false;
+    this._shutdownPromise = null;
     this.lastHeartbeat = Date.now();
     
     // Trigger tracking (for monitor() loop)
@@ -493,6 +496,89 @@ class BaseAgent {
       await this._reconcileAndSync();
     } catch (err) {
       console.error('⚠️  _handleSlTpFill error:', err.message);
+    }
+  }
+
+  /**
+   * Handle a liquidation event for this agent's position.
+   * Called by PositionTracker.onLiquidation when a fill with liquidation data is detected.
+   * Logs to Supabase and notifies the user with a clear liquidation message.
+   * 
+   * @param {Object} fillData - Liquidation fill details from PositionTracker
+   */
+  async _handleLiquidation(fillData) {
+    try {
+      const { coin, side, size, price, fee, orderId, markPrice, closedPnl, closedPosition } = fillData;
+
+      console.log(`💀 BaseAgent: LIQUIDATION for ${coin} — ${size} @ $${price.toFixed(2)} (mark: $${markPrice.toFixed(2)})`);
+
+      // Log trade to Supabase
+      const tradeRecord = {
+        agent_id: this.agentId,
+        timestamp: new Date().toISOString(),
+        coin,
+        side,
+        size,
+        price,
+        order_type: 'liquidation',
+        order_id: orderId,
+        trigger_reason: `LIQUIDATED @ $${price.toFixed(2)} (mark: $${markPrice.toFixed(2)})`,
+        pnl: closedPosition?.pnl?.net ?? closedPnl ?? null,
+        is_entry: false,
+        is_exit: true,
+        fee: fee ?? null,
+        fee_rate: null
+      };
+
+      const { error } = await this.supabase.from('agent_trades').insert(tradeRecord);
+      if (error) console.error('Failed to log liquidation trade to Supabase:', error);
+
+      // Write position history if we have PnL
+      if (closedPosition && closedPosition.pnl) {
+        const historyRecord = this._buildPositionHistoryRecord(closedPosition);
+        const { error: histError } = await this.supabase.from('agent_position_history').insert(historyRecord);
+        if (histError) console.error('Failed to log liquidation position history:', histError);
+      }
+
+      // Mark order as filled in ownership store
+      if (this.orderExecutor.orderOwnershipStore && orderId) {
+        this.orderExecutor.orderOwnershipStore.markByOrderId(orderId, 'filled');
+      }
+
+      // Update daily PnL accumulator
+      const pnl = closedPosition?.pnl?.net ?? closedPnl ?? 0;
+      this._dailyPnl += pnl;
+
+      // Notify user with a prominent liquidation message
+      const pnlStr = closedPosition?.pnl
+        ? `PnL: $${closedPosition.pnl.net.toFixed(4)} (${closedPosition.pnl.percent.toFixed(2)}% ROI)`
+        : closedPnl != null
+          ? `PnL: $${closedPnl.toFixed(4)}`
+          : 'PnL: unknown';
+
+      const entryPrice = closedPosition?.entry?.price;
+      const entryStr = entryPrice ? `Entry was $${entryPrice.toFixed(2)}. ` : '';
+
+      await this.updateState('liquidation', {
+        coin,
+        side,
+        size,
+        price,
+        markPrice,
+        pnl: closedPosition?.pnl?.net ?? closedPnl ?? null,
+        pnlPercent: closedPosition?.pnl?.percent ?? null,
+        entryPrice: entryPrice ?? null,
+        fee
+      },
+        `💀 ${coin}: POSITION LIQUIDATED. ${size} closed @ $${price.toFixed(2)} ` +
+        `(mark price: $${markPrice.toFixed(2)}). ${entryStr}${pnlStr}. ` +
+        `Fee: $${(fee || 0).toFixed(4)}. Position fully closed by exchange.`
+      );
+
+      // Sync positions after the liquidation
+      await this._reconcileAndSync();
+    } catch (err) {
+      console.error('⚠️  _handleLiquidation error:', err.message);
     }
   }
 
@@ -1064,17 +1150,24 @@ class BaseAgent {
         console.warn('⚠️  WebSocket price subscription failed, using REST fallback:', e.message);
       }
       
-      // Subscribe to user fill events for real-time SL/TP detection.
+      // Subscribe to user fill events for real-time SL/TP + liquidation detection.
       // Uses a fan-out pattern so agent-level userFill triggers can coexist
       // with this infrastructure-level handler.
-      console.log('📡 Subscribing to user fill events for SL/TP detection...');
+      console.log('📡 Subscribing to user fill events for SL/TP + liquidation detection...');
       try {
         this.wsManager.subscribeUserEvents((event) => {
-          // Infrastructure: route fill events to PositionTracker for SL/TP detection.
+          // Infrastructure: route fill events to PositionTracker for SL/TP and liquidation detection.
           // WS user events arrive as { fills: [...] }, { funding: {...} }, etc.
           if (event && Array.isArray(event.fills)) {
             for (const fill of event.fills) {
-              this.positionTracker.handleFillEvent(fill);
+              // Check if this fill is a liquidation of this agent's position
+              if (fill.liquidation && fill.liquidation.liquidatedUser === this.userAddress) {
+                // This is OUR position being liquidated
+                this.positionTracker.handleLiquidationFill(fill);
+              } else {
+                // Normal fill — check if it's an SL/TP fill
+                this.positionTracker.handleFillEvent(fill);
+              }
             }
           }
           // Fan out to any agent-level userFill triggers
@@ -1083,7 +1176,7 @@ class BaseAgent {
           }
         });
       } catch (e) {
-        console.warn('⚠️  User events subscription failed, SL/TP detection will use REST fallback:', e.message);
+        console.warn('⚠️  User events subscription failed, SL/TP + liquidation detection will use REST fallback:', e.message);
       }
       
       // Start monitoring
@@ -1238,11 +1331,25 @@ class BaseAgent {
    * 6. Update state to 'stopped'
    */
   async shutdown() {
+    // Guard: if shutdown is already in progress, wait for it to finish rather than
+    // returning early. This prevents the race condition where a second SHUTDOWN call
+    // (from polling fallback) triggers process.exit(0) while the first is mid-flight.
+    if (this._shutdownInProgress) {
+      console.warn('⚠️  Shutdown already in progress — waiting for it to complete');
+      return this._shutdownPromise;
+    }
+
     if (!this.isRunning) {
       console.warn('⚠️  Agent not running');
       return;
     }
     
+    this._shutdownInProgress = true;
+    this._shutdownPromise = this._executeShutdown();
+    return this._shutdownPromise;
+  }
+
+  async _executeShutdown() {
     try {
       console.log(`\n🛑 Shutting down agent ${this.agentId}...`);
       await this.updateState('lifecycle', {}, 'Agent shutting down');
@@ -1284,37 +1391,45 @@ class BaseAgent {
         const trackedCoins = Object.keys(this.positionTracker.openPositions);
         
         for (const coin of trackedCoins) {
-          const localPos = this.positionTracker.openPositions[coin];
-          if (!localPos) continue;
-          
-          const agentSize = localPos.entry.size;
-          const isLong = localPos.entry.side === 'buy';
-          
-          console.log(`   Closing ${coin}: ${isLong ? '+' : '-'}${agentSize} (agent's tracked size)`);
-          
-          // Close only the agent's portion using partial close
-          const closeResult = await this.orderExecutor.closePosition(coin, agentSize);
-          
-          if (closeResult.success) {
-            console.log(`   ✅ ${coin} position closed`);
-            await this.logTrade({
-              coin,
-              side: isLong ? 'sell' : 'buy',
-              size: closeResult.filledSize || agentSize,
-              price: closeResult.averagePrice,
-              order_type: 'close_position',
-              order_id: closeResult.orderId,
-              trigger_reason: 'Agent shutdown - closing tracked positions',
-              is_exit: true,
-              fee: closeResult.fee,
-              fee_rate: closeResult.feeRate
-            });
-          } else {
-            console.warn(`   ⚠️  Failed to close ${coin}: ${closeResult.error}`);
+          try {
+            const localPos = this.positionTracker.openPositions[coin];
+            if (!localPos) continue;
+            
+            const agentSize = localPos.entry.size;
+            const isLong = localPos.entry.side === 'buy';
+            
+            console.log(`   Closing ${coin}: ${isLong ? '+' : '-'}${agentSize} (agent's tracked size)`);
+            
+            // Close only the agent's portion using partial close
+            const closeResult = await this.orderExecutor.closePosition(coin, agentSize);
+            
+            if (closeResult.success) {
+              console.log(`   ✅ ${coin} position closed`);
+              await this.logTrade({
+                coin,
+                side: isLong ? 'sell' : 'buy',
+                size: closeResult.filledSize || agentSize,
+                price: closeResult.averagePrice,
+                order_type: 'close_position',
+                order_id: closeResult.orderId,
+                trigger_reason: 'Agent shutdown - closing tracked positions',
+                is_exit: true,
+                fee: closeResult.fee,
+                fee_rate: closeResult.feeRate
+              });
+            } else {
+              console.warn(`   ⚠️  Failed to close ${coin}: ${closeResult.error}`);
+            }
+          } catch (e) {
+            console.error(`   ❌ Error closing ${coin} during shutdown: ${e.message}`);
           }
         }
       }
       
+      // Reconcile position tracker BEFORE closing WS (needs API access)
+      console.log('📊 Reconciling positions after closes...');
+      await this.reconcileTrackedPositions();
+
       // Close WebSocket connections
       console.log('🔌 Closing WebSocket connections...');
       this.wsManager.close();
@@ -1325,7 +1440,6 @@ class BaseAgent {
       
       // Final comprehensive state sync and evaluation
       console.log('📊 Recording final evaluation...');
-      await this.reconcileTrackedPositions();
       
       // Single API call for all account data
       const { positions, accountValue, availableBalance } =
@@ -1397,6 +1511,7 @@ class BaseAgent {
         .from('agents')
         .update({ 
           status: 'stopped',
+          agent_deployed: false,
           updated_at: new Date().toISOString()
         })
         .eq('id', this.agentId);
@@ -1428,8 +1543,23 @@ class BaseAgent {
       
     } catch (error) {
       console.error('❌ Shutdown error:', error);
-      await this.updateState('error', { error: error.message }, 'Shutdown failed');
+      try {
+        await this.updateState('error', { error: error.message }, `Shutdown failed: ${error.message}`);
+        // Still try to update DB status even on error
+        await this.supabase
+          .from('agents')
+          .update({ 
+            status: 'stopped',
+            agent_deployed: false,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', this.agentId);
+      } catch (dbError) {
+        console.error('❌ Failed to update DB during shutdown error:', dbError.message);
+      }
       throw error;
+    } finally {
+      this._shutdownInProgress = false;
     }
   }
   
