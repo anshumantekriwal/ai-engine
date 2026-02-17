@@ -114,12 +114,222 @@ def _lint_check(js_code: str) -> List[str]:
     return errors
 
 
+def _extract_declarations(code: str) -> set:
+    """Extract all variable names declared via const/let/var/for/function params in JS code."""
+    declared = set()
+    # const x = ..., let y = ..., var z = ...
+    declared.update(re.findall(r'(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[=;,]', code))
+    # Destructured: const { a, b } = ... or const { a: b } = ...
+    for match in re.finditer(r'(?:const|let|var)\s*\{([^}]+)\}', code):
+        inner = match.group(1)
+        for part in inner.split(','):
+            part = part.strip()
+            if ':' in part:
+                declared.add(part.split(':')[-1].strip().split('=')[0].strip())
+            elif part:
+                declared.add(part.split('=')[0].strip())
+    # Array destructuring: const [a, b] = ...
+    for match in re.finditer(r'(?:const|let|var)\s*\[([^\]]+)\]', code):
+        for part in match.group(1).split(','):
+            part = part.strip().split('=')[0].strip()
+            if part and not part.startswith('...'):
+                declared.add(part.lstrip('.'))
+            elif part.startswith('...'):
+                declared.add(part[3:].strip())
+    # for (const x of ...) / for (const x in ...)
+    declared.update(re.findall(r'for\s*\(\s*(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s+(?:of|in)', code))
+    # Arrow/function params: (x, y) => ... or function(x, y) { or async (x) => ...
+    # Match arrow functions specifically: `(params) => {` or `async (params) => {`
+    for match in re.finditer(r'\(([^()]*)\)\s*=>\s*\{', code):
+        for param in match.group(1).split(','):
+            param = param.strip().split('=')[0].strip()
+            if param and not param.startswith('...') and re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$', param):
+                declared.add(param)
+            elif param and param.startswith('...'):
+                rest = param[3:].strip()
+                if re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$', rest):
+                    declared.add(rest)
+    # Also match `function name(params) {` and `function(params) {`
+    for match in re.finditer(r'function\s*[a-zA-Z_$]*\s*\(([^)]*)\)\s*\{', code):
+        for param in match.group(1).split(','):
+            param = param.strip().split('=')[0].strip()
+            if param and not param.startswith('...') and re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$', param):
+                declared.add(param)
+            elif param and param.startswith('...'):
+                rest = param[3:].strip()
+                if re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$', rest):
+                    declared.add(rest)
+    # Catch `async (params) => {` where async is on the same line (inner callback)
+    for match in re.finditer(r'async\s+\(([^()]*)\)\s*=>\s*\{', code):
+        for param in match.group(1).split(','):
+            param = param.strip().split('=')[0].strip()
+            if param and not param.startswith('...') and re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$', param):
+                declared.add(param)
+    # function name(x) { ... }
+    declared.update(re.findall(r'function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(', code))
+    return declared
+
+
+def _strip_comments_and_strings(code: str) -> str:
+    """Remove comments and string literals from JS code to avoid false positives."""
+    stripped = re.sub(r'//[^\n]*', '', code)
+    stripped = re.sub(r'/\*[\s\S]*?\*/', '', stripped)
+    # Template literals (simplified — doesn't handle nested backticks)
+    stripped = re.sub(r'`[^`]*`', '""', stripped)
+    stripped = re.sub(r"'[^']*'", '""', stripped)
+    stripped = re.sub(r'"[^"]*"', '""', stripped)
+    return stripped
+
+
+def _variable_ref_check(
+    initialization_code: str,
+    trigger_code: str,
+    execution_code: str,
+) -> List[str]:
+    """
+    Check for variables used but never declared within each method body.
+    
+    Catches bugs like `rebalancesPerRebalance` used but only `rebalancesPerDay` declared.
+    Operates per-section but also considers init code declarations available to all sections.
+    """
+    errors = []
+
+    # JS built-in globals, Web APIs, and framework globals that are always available
+    known_globals = {
+        # JS primitives/keywords that regex picks up
+        'undefined', 'null', 'true', 'false', 'NaN', 'Infinity',
+        # Built-in constructors and namespaces
+        'console', 'Math', 'Date', 'JSON', 'Object', 'Array', 'Map', 'Set',
+        'WeakMap', 'WeakSet', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt',
+        'Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError',
+        'Promise', 'RegExp', 'Proxy', 'Reflect', 'ArrayBuffer', 'DataView',
+        'Float32Array', 'Float64Array', 'Int8Array', 'Int16Array', 'Int32Array',
+        'Uint8Array', 'Uint16Array', 'Uint32Array',
+        # Global functions
+        'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURIComponent',
+        'decodeURIComponent', 'encodeURI', 'decodeURI', 'eval', 'atob', 'btoa',
+        'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+        'fetch', 'queueMicrotask', 'structuredClone',
+        # Node.js globals
+        'process', 'Buffer', 'global', 'globalThis', '__dirname', '__filename',
+        'require', 'module', 'exports',
+        # Framework globals (re-exported by BaseAgent.js module wrapper)
+        'getAllMids', 'getCandleSnapshot', 'getTicker', 'getL2Book',
+        'getFundingHistory', 'getMetaAndAssetCtxs', 'getRecentTrades',
+        'getPredictedFundings', 'getPerpsAtOpenInterestCap',
+        'getOpenOrders', 'getFrontendOpenOrders', 'getUserFills',
+        'getUserFillsByTime', 'getHistoricalOrders', 'getPortfolio',
+        'getSubAccounts', 'getUserFees',
+    }
+
+    js_keywords = {
+        'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue',
+        'return', 'throw', 'try', 'catch', 'finally', 'new', 'delete', 'typeof',
+        'instanceof', 'in', 'of', 'function', 'class', 'const', 'let', 'var',
+        'async', 'await', 'yield', 'import', 'export', 'default', 'from', 'this',
+        'void', 'with', 'debugger', 'super', 'extends', 'implements', 'static',
+        'get', 'set',
+    }
+
+    # Common short identifiers that cause false positives (loop vars, params, etc.)
+    common_short = {
+        'err', 'res', 'req', 'msg', 'val', 'obj', 'arr', 'str', 'num', 'buf',
+        'idx', 'len', 'max', 'min', 'sum', 'avg', 'cnt', 'tmp', 'ret', 'ref',
+        'arg', 'args', 'opts', 'cfg', 'ctx', 'env', 'url', 'uri', 'src', 'dst',
+        'col', 'row', 'pos', 'dir', 'out',
+    }
+
+    # Implicit params available in execution code (from executeTrade wrapper)
+    execution_implicit = {'triggerData'}
+
+    # Gather init declarations — init code's const/let are NOT directly accessible
+    # in trigger/execution (they run in separate function scopes), but this.* properties
+    # set in init ARE available. We only use init declarations for the init section itself.
+
+    sections = [
+        ("initialization", initialization_code),
+        ("triggers", trigger_code),
+        ("execution", execution_code),
+    ]
+
+    for label, code in sections:
+        if not code.strip():
+            continue
+
+        stripped = _strip_comments_and_strings(code)
+        local_declarations = _extract_declarations(stripped)
+
+        # Add section-specific implicit params
+        if label == "execution":
+            local_declarations |= execution_implicit
+
+        # Remove object literal keys — `{ key: value }` patterns
+        # Replace object literal contents with empty to avoid flagging property names
+        obj_key_stripped = re.sub(r'([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:', 'OBJKEY:', stripped)
+
+        # Find all free-standing identifier usages (not after . which means property access)
+        all_identifiers = set(re.findall(r'(?<![.\w$])([a-zA-Z_$][a-zA-Z0-9_$]*)', obj_key_stripped))
+
+        # Candidates: identifiers used but not declared locally or known globally
+        undeclared = all_identifiers - local_declarations - known_globals - js_keywords - common_short
+        # Also exclude 'OBJKEY' from the substitution
+        undeclared.discard('OBJKEY')
+
+        # Filter: only flag multi-word camelCase names (compound identifiers)
+        # These are almost always user-defined variables, not missed builtins.
+        # A "compound" name has at least one uppercase letter after the first char,
+        # indicating camelCase like `rebalancesPerRebalance`, `dailyFeeBurn`, etc.
+        compound_undeclared = {
+            v for v in undeclared
+            if len(v) > 4 and re.search(r'[a-z][A-Z]', v) and v[0].islower()
+        }
+
+        for var_name in sorted(compound_undeclared):
+            # Try to find a similarly-named declared variable for a helpful suggestion
+            suggestion = _find_similar_declaration(var_name, local_declarations)
+            if suggestion:
+                errors.append(
+                    f"[{label}] Undeclared variable `{var_name}` — did you mean `{suggestion}`?"
+                )
+            else:
+                errors.append(
+                    f"[{label}] Undeclared variable `{var_name}` — not declared in this scope"
+                )
+
+    return errors
+
+
+def _find_similar_declaration(name: str, declared: set) -> Optional[str]:
+    """Find the most similar declared variable name (for typo suggestions)."""
+    best = None
+    best_score = 0
+    for d in declared:
+        # Skip very short declarations (loop vars, catch params)
+        if len(d) < 4:
+            continue
+        # Check common prefix length
+        prefix_len = 0
+        for a, b in zip(name, d):
+            if a == b:
+                prefix_len += 1
+            else:
+                break
+        # Require at least 5 shared prefix chars for a suggestion
+        if prefix_len >= 5 and prefix_len > best_score:
+            best = d
+            best_score = prefix_len
+        # Check if one contains the other (but only for substantial names)
+        if len(d) >= 4 and (name in d or d in name):
+            return d
+    return best
+
+
 def _run_all_checks(
     initialization_code: str,
     trigger_code: str,
     execution_code: str,
 ) -> Dict[str, List[str]]:
-    """Run syntax and lint checks on all three code sections."""
+    """Run syntax, lint, and variable reference checks on all three code sections."""
     syntax_errors = []
     lint_issues = []
 
@@ -133,6 +343,10 @@ def _run_all_checks(
             syntax_errors.append(f"[{label}] {err}")
         for issue in _lint_check(code):
             lint_issues.append(f"[{label}] {issue}")
+
+    # Cross-check variable references (catches typos like rebalancesPerRebalance vs rebalancesPerDay)
+    for issue in _variable_ref_check(initialization_code, trigger_code, execution_code):
+        lint_issues.append(issue)
 
     return {"syntax_errors": syntax_errors, "lint_issues": lint_issues}
 

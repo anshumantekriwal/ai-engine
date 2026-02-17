@@ -359,6 +359,9 @@ CODE QUALITY:
 19. Use ?. for potentially undefined objects. Check array lengths before accessing.
 20. Wrap executeTrade body in try-catch. Log errors via updateState with full context.
 21. Variables set in onInitialize must match usage in setupTriggers and executeTrade.
+    CRITICAL: Every local variable you use MUST be declared in the SAME method body.
+    If you declare `const rebalancesPerDay = ...`, do NOT later write `rebalancesPerRebalance` — this
+    will cause a ReferenceError crash. Double-check every variable name before returning code.
 
 APIS THAT DO NOT EXIST (never use these — they cause immediate crashes):
 22. There is NO this.logger, this.log, or any logging object. Use console.log for debug,
@@ -408,18 +411,23 @@ def build_agent_user_prompt(strategy_description: str) -> str:
 {strategy_description}
 </strategy>
 
-IMPORTANT — Before generating code:
-1. Use list_source_files to see what's available
-2. Read BaseAgent.js and orderExecutor.js (mandatory — understand exact signatures)
-3. Read perpMarket.js if you need any market data functions (to see return shapes)
-4. Read ws.js if the strategy needs real-time WebSocket data
-5. Read any other files relevant to the strategy
-6. Read at least one few-shot example to see the expected code quality and patterns
-7. Think through the 5-step framework before coding:
+IMPORTANT — Before generating code, read the source files. Minimize tool calls by batching reads.
+
+STEP 1 (1 tool call): list_source_files to see what's available.
+STEP 2 (1 tool call): Read BaseAgent.js — mandatory to understand class structure, available methods, re-exports.
+STEP 3 (1 tool call): Read orderExecutor.js — mandatory to understand order placement signatures.
+STEP 4 (1 tool call): Read ONE few-shot example (fewshot_example_a.json or fewshot_example_b.json) to match expected quality.
+STEP 5 (0-1 tool calls): ONLY IF the strategy needs it:
+   - Read perpMarket.js if you call market data functions (getAllMids, getTicker, etc.) and are unsure of return shapes.
+   - Read ws.js ONLY if the strategy uses real-time WebSocket subscriptions.
+   - Do NOT read config.js, utils.js, apiClient.js, or other utility files — they are internal and you don't call them directly.
+STEP 6: Think through the 5-step framework, then generate the JSON.
    a. What class of strategy? (trend/reversion/breakout/range/event/carry/scheduled)
    b. What data architecture? (WebSocket / HTTP / hybrid — and why)
    c. What is the trade idea lifecycle? (constitutes / invalidates / resets)
    d. How should positions be sized? (SL/TP, leverage, fees)
    e. What will the user see on their dashboard at each stage?
+
+TARGET: 4-5 tool calls total (list + BaseAgent + orderExecutor + fewshot + maybe one more). Do NOT over-read.
 
 Then return the JSON with initialization_code, trigger_code, and execution_code."""
