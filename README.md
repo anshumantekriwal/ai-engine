@@ -1,100 +1,141 @@
 # AI Agent Code Generator
 
-Comprehensive AI-powered code generation system for Hyperliquid trading agents using state-of-the-art prompting techniques.
+Generates production-ready JavaScript trading agent code for Hyperliquid perpetual futures using an agentic AI pipeline. The model reads actual source files via tool calls to understand exact function signatures before generating code — eliminating documentation drift entirely.
 
-## Features
+## How It Works
 
-- ✅ **Unified Generation**: All three methods generated together for maximum cohesion
-- ✅ **Multi-Provider Support**: Anthropic (Claude) and OpenAI (GPT)
-- ✅ **Chain of Thought Reasoning**: Advanced prompting for better code quality
-- ✅ **Enhanced Validation**: Comprehensive linting with syntax, logic, and safety checks
-- ✅ **Guardrails**: Built-in safety validation and error prevention
-- ✅ **Code Validation**: Automatic syntax and logic checking with auto-correction
-- ✅ **Retry Mechanism**: Exponential backoff for reliability
-- ✅ **Supabase Integration**: Direct storage of generated agents
-- ✅ **RESTful API**: Easy integration with frontend
-- ✅ **JSON Output**: Structured response format for parsing
-- ✅ **Spec/Hybrid Generation**: Generates validated `strategy_spec` for declarative runtime
-- ✅ **Backtest Spec Generation**: Generates validated backtest-tool `strategy_spec` from plain text
+Unlike traditional prompt-based code generation where API docs are embedded in the system prompt, this system gives the AI model **tools to read the actual source code** of the trading framework. The model:
+
+1. Receives the user's strategy description
+2. Calls `read_source_file()` to inspect `BaseAgent.js`, `orderExecutor.js`, `ws.js`, etc.
+3. Reads few-shot examples to understand expected code quality
+4. Reasons through a 5-step thinking framework (classify, data architecture, lifecycle, sizing, logging)
+5. Generates code with full knowledge of real function signatures and return types
+6. Post-generation lint/syntax checks catch remaining issues, with self-correction if needed
+
+This means when someone adds a method to `orderExecutor.js` or changes a return shape in `perpMarket.js`, the AI automatically picks it up next generation. Zero documentation maintenance.
 
 ## Architecture
 
 ```
 ai-engine/
-├── server.py              # FastAPI server with REST endpoints
-├── code_generator.py      # Core unified generation logic
-├── ai_providers.py        # AI provider abstractions (Claude/GPT)
-├── prompts.py             # Comprehensive system and validation prompts
-├── backtest_spec_prompts.py    # Claude-optimized backtest few-shot prompts
-├── backtest_spec_schema.py     # Backtest strategy spec validator
-├── backtest_spec_generator.py  # Plaintext -> backtest spec generator
-├── requirements.txt       # Python dependencies
-└── env.example            # Environment variables template
+├── server.py                 # FastAPI server (4 endpoints)
+├── agent_generator.py        # Agentic code generation + lint/syntax checks
+├── agent_prompts.py          # System prompt, thinking framework, rules
+├── ai_providers.py           # AI provider abstraction (Anthropic/OpenAI)
+├── backtest_spec_generator.py    # Backtest spec generation
+├── backtest_spec_prompts.py      # Backtest spec prompts
+├── backtest_spec_schema.py       # Backtest spec validation
+├── source_files/             # Hyperliquid JS source files (read by the model)
+│   ├── BaseAgent.js
+│   ├── orderExecutor.js
+│   ├── ws.js
+│   ├── perpMarket.js
+│   ├── perpUser.js
+│   ├── PositionTracker.js
+│   ├── TechnicalIndicatorService.js
+│   ├── config.js
+│   ├── utils.js
+│   ├── apiClient.js
+│   ├── OrderOwnershipStore.js
+│   ├── fewshot_example_a.json
+│   └── fewshot_example_b.json
+├── requirements.txt
+├── PROMPT_IMPROVEMENTS.md    # Backlog of issues from stress testing
+└── .env
 ```
 
-## Key Design Principles
+## Setup
 
-### Unified Generation
-Unlike traditional multi-step generation, this system generates all three methods (`onInitialize`, `setupTriggers`, `executeTrade`) in a **single AI call**. This ensures:
-- ✅ Variable consistency across methods
-- ✅ Logical cohesion in strategy implementation
-- ✅ Better context understanding by the AI
-- ✅ Reduced API calls and latency
-
-### Enhanced Validation
-The system includes comprehensive code validation with:
-- **Syntax Validation**: Ensures valid JavaScript
-- **Variable Validation**: Checks for undefined references
-- **API Usage Validation**: Verifies correct function calls
-- **Logic Validation**: Detects contradictions and errors
-- **Safety Validation**: Enforces risk management checks
-- **Cohesion Validation**: Ensures methods work together
-- **Auto-Correction**: Attempts to fix detected issues
-
-### Linting & Guardrails
-Built-in linting system categorizes issues as:
-- **Errors**: Must fix (undefined variables, syntax errors)
-- **Warnings**: Should fix (missing safety checks, poor practices)
-- **Suggestions**: Nice to have (better comments, optimizations)
-
-## Installation
-
-1. **Install Dependencies**
 ```bash
 cd ai-engine
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. **Set Up Environment**
+### Environment Variables
+
 ```bash
-cp env.example .env
-# Edit .env and add your API keys
+# Required
+ANTHROPIC_API_KEY=sk-ant-...
+AI_PROVIDER=anthropic
+
+# Optional
+AI_MODEL=claude-sonnet-4-5          # Default model for backtest spec generation
+AGENT_MODEL=                        # Override model for code generation (defaults to AI_MODEL)
+AGENT_MAX_TURNS=15                  # Max agentic loop iterations
+VALIDATION_ENABLED=true             # Enable post-generation lint/syntax checks
 ```
 
-Required environment variables:
-```bash
-# AI Provider Configuration
-AI_PROVIDER=anthropic  # Options: "anthropic" or "openai"
-ANTHROPIC_API_KEY=sk-ant-...  # Required if using Anthropic
-OPENAI_API_KEY=sk-...  # Required if using OpenAI
+## API Endpoints
 
-# Supabase credentials
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_KEY=your-service-key
+### `POST /generate` — Generate Trading Agent Code
 
-# Optional: Model Configuration
-AI_MODEL=  # Leave blank for defaults (claude-sonnet-4-5 or gpt-5.2)
+The primary endpoint. Takes a plain-text strategy description, returns three JavaScript method bodies.
 
-# Optional: Generation Settings
-MAX_RETRIES=3
-VALIDATION_ENABLED=true
+**Request:**
+```json
+{
+  "strategy_description": "Buy BTC when RSI drops below 30 and MACD histogram crosses above 0. Use ATR-based sizing with $5 risk per trade at 5x leverage."
+}
 ```
 
-## Usage
+**Response:**
+```json
+{
+  "success": true,
+  "initialization_code": "// onInitialize() body...",
+  "trigger_code": "// setupTriggers() body...",
+  "execution_code": "// executeTrade(triggerData) body...",
+  "metadata": {
+    "turns": 4,
+    "tool_calls": 6,
+    "files_read": ["BaseAgent.js", "orderExecutor.js", "perpMarket.js", "fewshot_example_a.json"],
+    "total_tokens": 45230,
+    "input_tokens": 38100,
+    "output_tokens": 7130,
+    "thinking_tokens": 4200
+  }
+}
+```
 
-### Start the Server
+### `POST /generate-backtest-spec` — Generate Backtest Strategy Spec
+
+Generates a backtest-tool-compatible `strategy_spec` payload from plain text.
+
+**Request:**
+```json
+{
+  "strategy_description": "Trade BTC using EMA 9/21 crossover on 5m candles with 5x leverage and 4% stop loss."
+}
+```
+
+### `POST /backtest-spec/validate` — Validate Backtest Spec
+
+Validates a `strategy_spec` payload against the backtest-tool contract.
+
+**Request:**
+```json
+{
+  "strategy_spec": { ... }
+}
+```
+
+### `GET /status` — Health Check
+
+```json
+{
+  "status": "running",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-5",
+  "agent_model": "claude-sonnet-4-5",
+  "max_turns": 15,
+  "validation_enabled": true
+}
+```
+
+## Running
 
 **Development:**
 ```bash
@@ -106,273 +147,29 @@ python server.py
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-### API Endpoints
+## Keeping Source Files in Sync
 
-#### Hybrid/Spec Endpoints
-```bash
-POST /generate-spec
-POST /spec/validate
-POST /generate-backtest-spec
-POST /backtest-spec/validate
-```
-
-#### 1. Generate Complete Agent
-```bash
-POST /generate
-```
-
-**Request:**
-```json
-{
-  "user_id": "user_123",
-  "agent_name": "RSI Scalper",
-  "strategy_description": "Buy BTC when RSI < 30, sell when RSI > 70",
-  "strategy_config": {
-    "coin": "BTC",
-    "rsiPeriod": 14,
-    "oversoldLevel": 30,
-    "overboughtLevel": 70,
-    "positionSize": 0.01
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "agent_id": "uuid-here",
-  "initialization_code": "// Generated initialization code...",
-  "trigger_code": "// Generated triggers code...",
-  "execution_code": "// Generated execution code...",
-  "message": "Agent 'RSI Scalper' created successfully with ID uuid-here"
-}
-```
-
-#### 2. Regenerate Specific Method
-```bash
-PUT /agents/{agent_id}/regenerate?method_type=init
-```
-
-Query params: `method_type` = `init` | `triggers` | `execution`
-
-**Request:**
-```json
-{
-  "strategy_description": "Updated strategy description",
-  "strategy_config": {
-    "coin": "BTC",
-    "rsiPeriod": 21
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "agent_id": "uuid-here",
-  "method_type": "init",
-  "code": "// Regenerated code...",
-  "message": "init code regenerated successfully"
-}
-```
-
-#### 3. Health Check
-```bash
-GET /health
-```
-
-**Response:**
-```json
-{
-  "status": "healthy",
-  "ai_provider": "anthropic",
-  "model": "claude-sonnet-4",
-  "validation_enabled": true
-}
-```
-
-**Note**: The partial generation endpoints (`/generate/init`, `/generate/triggers`, `/generate/execution`) are deprecated in favor of unified generation.
-
-## Prompting Techniques
-
-### 1. Unified Prompt Architecture
-- **Single Generation Call**: All three methods generated together
-- **Cohesion by Design**: Variables initialized in one method are guaranteed to exist in others
-- **Context Preservation**: AI maintains full strategy context across all methods
-- **JSON Output**: Structured response for reliable parsing
-
-### 2. System Prompt
-- **Role-based prompting**: AI acts as an "elite JavaScript trading agent code generator"
-- **Clear constraints**: Only uses documented APIs
-- **Safety-first principles**: Emphasizes risk management
-- **Step-by-step thinking**: Encourages CoT reasoning before code generation
-
-### 3. User Prompt
-- **Strategy description**: Natural language explanation
-- **Configuration**: JSON parameters
-- **API documentation**: Complete reference of available functions
-- **Output specification**: Exact JSON structure required
-
-### 4. Validation Prompt
-- **8-point checklist**: Syntax, variables, APIs, logic, safety, cohesion, state, practices
-- **Severity levels**: Errors, warnings, suggestions
-- **Auto-correction**: Validator attempts to fix issues
-- **Lint summary**: Categorized issue counts
-
-## Code Generation Flow
-
-```
-1. User Request
-   ↓
-2. Unified Generation Call
-   - Generate all three methods together
-   - onInitialize() + setupTriggers() + executeTrade()
-   ↓
-3. Parse JSON Response
-   - Extract initialization_code
-   - Extract trigger_code
-   - Extract execution_code
-   ↓
-4. Comprehensive Validation
-   - Syntax checking
-   - Variable validation
-   - API usage verification
-   - Logic validation
-   - Safety checks
-   - Cohesion analysis
-   ↓
-5. Auto-Correction (if needed)
-   - Fix common errors
-   - Retry if necessary
-   ↓
-6. Store in Supabase
-   ↓
-7. Return Agent ID + Code
-```
-
-## Example Strategies
-
-### RSI Mean Reversion
-```json
-{
-  "strategy_description": "Buy when RSI < 30 (oversold), sell when RSI > 70 (overbought). Use 14-period RSI on 1h candles. Close opposite positions before opening new ones.",
-  "strategy_config": {
-    "coin": "BTC",
-    "rsiPeriod": 14,
-    "oversoldLevel": 30,
-    "overboughtLevel": 70,
-    "positionSize": 0.01,
-    "interval": "1h"
-  }
-}
-```
-
-### EMA Crossover
-```json
-{
-  "strategy_description": "Buy when fast EMA (12) crosses above slow EMA (26), sell when it crosses below. Check every minute.",
-  "strategy_config": {
-    "coin": "ETH",
-    "fastPeriod": 12,
-    "slowPeriod": 26,
-    "positionSize": 0.1,
-    "interval": "1h",
-    "checkInterval": 60000
-  }
-}
-```
-
-### Price Breakout
-```json
-{
-  "strategy_description": "Buy BTC when price breaks above $100,000, sell when it drops below $95,000. Use 5x leverage.",
-  "strategy_config": {
-    "coin": "BTC",
-    "breakoutPrice": 100000,
-    "exitPrice": 95000,
-    "positionSize": 0.05,
-    "leverage": 5
-  }
-}
-```
-
-## Error Handling
-
-The system includes comprehensive error handling:
-
-- **Validation Errors**: Returns detailed error messages
-- **API Failures**: Automatic retry with exponential backoff
-- **Syntax Errors**: Attempts auto-correction
-- **Database Errors**: Proper HTTP status codes
-
-## Best Practices
-
-1. **Clear Strategy Descriptions**: Be specific about entry/exit conditions
-2. **Sensible Config Values**: Use realistic position sizes and parameters
-3. **Test on Testnet First**: Always test generated agents on testnet
-4. **Monitor Logs**: Check server logs for generation details
-5. **Iterate**: Use regenerate endpoint to refine specific methods
-
-## Testing
+The `source_files/` directory contains copies of the Hyperliquid JavaScript source files that the AI model reads during code generation. When the Hyperliquid codebase changes, copy the updated files:
 
 ```bash
-# Run ai-engine regressions
-./scripts/run-regression.sh
+cp ../hyperliquid/BaseAgent.js source_files/
+cp ../hyperliquid/orderExecutor.js source_files/
+# etc.
 ```
 
-## Deployment
+Only whitelisted files can be read by the model (defined in `agent_generator.py`). The model cannot read `.env`, credentials, or any file outside the whitelist.
 
-### Docker (Recommended)
-```dockerfile
-FROM python:3.11-slim
+## Post-Generation Checks
 
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+After the model generates code, automated checks run:
 
-COPY . .
+- **Syntax validation** via esprima (JavaScript parser)
+- **Lint checks** via regex patterns:
+  - Missing `await` on async calls
+  - Sandboxing violations (`cancelAllOrders`, `closePosition` without size)
+  - Hallucinated APIs (`this.logger`, `this.log`)
+  - Wrong argument counts (`checkSafetyLimits` with 3 args instead of 2)
+  - Deprecated methods (`syncPositions`)
+  - Direct `positionTracker` access where wrappers exist
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-### Environment Variables for Production
-- Set `ENVIRONMENT=production`
-- Use service role key for Supabase
-- Configure appropriate CORS origins
-- Set up rate limiting
-
-## Monitoring
-
-- **Health Endpoint**: `/health` for uptime monitoring
-- **Logs**: Server logs include generation progress
-- **Supabase**: Track agent creation and usage
-
-## Limitations
-
-- Maximum 4000 tokens per generation (configurable)
-- Code validation is heuristic-based
-- Requires valid Supabase schema
-- AI may occasionally generate invalid code (retry mechanism helps)
-
-## Future Enhancements
-
-- [ ] Code playground for testing generated code
-- [ ] Strategy templates library
-- [ ] Multi-coin support
-- [ ] Backtesting integration
-- [ ] Performance analytics
-- [ ] Version control for agent code
-
-## Support
-
-For issues or questions:
-1. Check server logs for detailed error messages
-2. Verify environment variables are set correctly
-3. Ensure Supabase schema matches expected structure
-4. Test with simple strategies first
-
-## License
-
-MIT
+If issues are found, a self-correction pass sends them back to the model within the same conversation context for fixing.
