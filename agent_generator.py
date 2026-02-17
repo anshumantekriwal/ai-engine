@@ -648,13 +648,25 @@ class AgentCodeGenerator:
         total_cache_read_tokens = 0
         total_cache_creation_tokens = 0
 
+        # Prompt caching: wrap system prompt so it's cached across turns.
+        # This avoids re-processing the ~5K token system prompt on every turn.
+        # Anthropic's ephemeral cache stays alive as long as requests keep coming
+        # (refreshed on each call), so it stays hot for the entire generation loop.
+        cached_system = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
         for turn in range(self.max_turns):
             print(f"\n📡 Turn {turn + 1}/{self.max_turns}...")
 
             async def _api_call():
                 kwargs = dict(
                     model=self.model,
-                    system=system_prompt,
+                    system=cached_system,
                     messages=messages,
                     tools=TOOLS,
                     max_tokens=16384,
@@ -846,10 +858,18 @@ class AgentCodeGenerator:
         try:
             from agent_prompts import AGENT_SYSTEM_PROMPT
 
+            cached_correction_system = [
+                {
+                    "type": "text",
+                    "text": AGENT_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
             async def _correction_call():
                 return await self.client.messages.create(
                     model=self.model,
-                    system=AGENT_SYSTEM_PROMPT,
+                    system=cached_correction_system,
                     messages=correction_messages,
                     max_tokens=16384,
                     temperature=0.3,

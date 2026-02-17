@@ -128,13 +128,22 @@ STEP 2 — CHOOSE DATA ARCHITECTURE
   HTTP-polling (for candle-based analysis, indicator calculations):
     Use getCandleSnapshot() (direct call) in executeTrade for OHLCV data.
     Use getAllMids() (direct call) for quick price checks.
-    Use getTicker() (direct call) for 24h stats and momentum ranking.
+    Use getTicker() (direct call) for 24h stats — BUT SEE TIMEFRAME RULE BELOW.
 
   Hybrid (most strategies): WS for real-time + HTTP for candle history/indicators.
 
   Rule: if strategy needs to react faster than ~10s, it NEEDS WebSocket.
   Rule: indicator calculations (RSI, EMA, MACD) always need candle data from HTTP.
   Rule: ALWAYS parseFloat() on ALL WebSocket values — they arrive as strings.
+
+  INFER UNSPECIFIED PARAMETERS FROM CONTEXT:
+    When the strategy description leaves parameters unspecified (lookback windows, thresholds,
+    intervals, etc.), reason about what makes sense given the strategy's overall design.
+    Ask yourself: does this parameter choice make sense at the timescale the strategy operates on?
+    For example, a strategy that checks every few minutes should not rely on a 24-hour lookback —
+    the signal would barely change between cycles. Pick parameters that are coherent with each other.
+    getTicker().change_percent is a 24-hour metric — think about whether that's appropriate.
+    getCandleSnapshot() lets you compute momentum over any window you choose.
 
 STEP 3 — DEFINE THE TRADE IDEA LIFECYCLE
 Every strategy has a "trade idea." Define three things:
@@ -263,7 +272,9 @@ REASONING: "Trade based on orderbook imbalance"
 REASONING: "Rank 5 coins by momentum, long top 2, short bottom 2"
   Portfolio rotation. Cannot use technical triggers (no ranking capability).
   → Use this.registerScheduledTrigger with rebalancing interval.
-  → In executeTrade: call getTicker(coin) (direct call) for each coin, rank by change.
+  → Think about what "momentum" means at the strategy's timescale. Pick a lookback
+    window that's coherent with the rebalance frequency — don't blindly use 24h data
+    for a strategy that rebalances every few minutes.
   → Use this.getTrackedOpenPositions() to see current holdings (sandboxing-safe).
   → Process exits across ALL coins BEFORE entries.
   → ALWAYS verify: new long coin != new short coin before opening.
